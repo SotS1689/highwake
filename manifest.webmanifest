@@ -1,0 +1,16 @@
+{
+    "name": "Highwake",
+    "short_name": "Highwake",
+    "description": "Ride a sky-dragon through colossal floating islands, alongside sky whales, high above the clouds and a world far below.",
+    "start_url": "./",
+    "scope": "./",
+    "display": "fullscreen",
+    "orientation": "landscape",
+    "background_color": "#0d1b2e",
+    "theme_color": "#0d1b2e",
+    "icons": [
+        { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+        { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+        { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    ]
+}

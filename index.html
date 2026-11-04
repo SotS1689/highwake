@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YW31K785WW"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-YW31K785WW');
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Highwake</title>
+    <meta name="description" content="Ride a sky-dragon through a world of colossal floating islands, sky whales and ancient wonders, high above the clouds. Free, in your browser.">
+    <meta name="theme-color" content="#0d1b2e">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Highwake">
+    <meta property="og:description" content="Ride a sky-dragon through colossal floating islands, alongside sky whales, high above the clouds and a world far below.">
+    <meta property="og:image" content="https://sots1689.github.io/highwake/og.png">
+    <meta property="og:url" content="https://sots1689.github.io/highwake/">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="view" aria-label="Highwake game view"></canvas>
+
+    <!-- In-flight HUD -->
+    <div id="hud" hidden>
+        <div id="compass" aria-hidden="true"><div id="compass-strip"></div><div id="compass-needle"></div></div>
+        <div id="status-line" aria-live="polite"></div>
+        <div id="toasts" aria-live="polite"></div>
+        <div id="markers" aria-hidden="true"></div>
+        <div id="reticle" aria-hidden="true"></div>
+        <div id="stick" aria-hidden="true"></div>
+        <div id="keys" aria-label="Sky keys"></div>
+        <div id="gauges">
+            <div class="gauge"><span class="g-val" id="g-speed">0</span><span class="g-unit">m/s</span></div>
+            <div class="bars">
+                <div class="bar" title="Speed"><span>SPEED</span><i id="b-throttle"></i></div>
+                <div class="bar boost" title="Wing strength"><span>WING</span><i id="b-boost"></i></div>
+            </div>
+            <div class="gauge"><span class="g-val" id="g-alt">0</span><span class="g-unit">m alt</span></div>
+        </div>
+        <div id="hint"></div>
+        <div id="flash"></div>
+    </div>
+
+    <!-- Top bar, shown over title and pause -->
+    <header id="topbar">
+        <button class="icon-btn" id="btn-journal" aria-label="Journal" title="Journal (J)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h11a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm1 3v14h9V5H7zm2 2h5v2H9V7zm0 4h5v2H9v-2z"/></svg>
+        </button>
+        <button class="icon-btn" id="btn-settings" aria-label="Settings" title="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3h-4l-.4 2.7c-.6.3-1.2.6-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1c.5.4 1.1.7 1.7 1L11 21h4l.4-2.7c.6-.3 1.2-.6 1.7-1l2.5 1 2-3.5-2.2-1.8zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>
+        </button>
+        <button class="icon-btn" id="btn-theme" aria-label="Toggle light or dark menus" title="Light / dark menus">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-.9-.1-1.4A5.5 5.5 0 0 1 12.4 3.1L12 3z"/></svg>
+        </button>
+        <button class="icon-btn" id="btn-info" aria-label="About and privacy" title="About and privacy">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+        </button>
+        <div class="support-wrap">
+            <a class="icon-btn" id="support" href="https://buymeacoffee.com/taylordrummond"
+               target="_blank" rel="noopener" aria-label="Support" title="Support">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            </a>
+            <div id="support-callout" role="dialog" aria-label="Support this project">
+                <div class="support-callout-arrow"></div>
+                <p class="support-callout-title">A quick note &mdash;</p>
+                <p class="support-callout-body">This project is built and maintained in spare time so that anyone can use it for free. If it's been a help to you, would you consider supporting it? Every bit keeps it running for the next person too.</p>
+                <div class="support-callout-actions">
+                    <a href="https://buymeacoffee.com/taylordrummond" target="_blank" rel="noopener"
+                       class="support-callout-btn support-callout-btn-primary" data-support="acted">Yes</a>
+                    <button type="button" class="support-callout-btn support-callout-btn-secondary" data-support="later">Maybe later</button>
+                    <button type="button" class="support-callout-btn support-callout-btn-text" data-support="forever">Don't ask again</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Title screen -->
+    <section id="title" class="screen">
+        <div class="title-inner">
+            <h1>Highwake</h1>
+            <p class="tag">Fly the high sky.</p>
+            <div id="loading">
+                <div class="load-bar"><i id="load-fill"></i></div>
+                <p id="load-text">Raising the islands&hellip;</p>
+            </div>
+            <div id="title-actions" hidden>
+                <button class="btn primary" id="btn-fly">Take flight</button>
+                <button class="btn" id="btn-controls">Controls</button>
+                <button class="btn" id="btn-install" hidden>Install app</button>
+            </div>
+            <p class="title-foot" id="title-progress"></p>
+        </div>
+    </section>
+
+    <!-- Pause -->
+    <section id="pause" class="screen" hidden>
+        <div class="panel small">
+            <h2>Paused</h2>
+            <div class="stack">
+                <button class="btn primary" id="btn-resume">Resume flight</button>
+                <button class="btn" id="btn-p-journal">Journal</button>
+                <button class="btn" id="btn-p-settings">Settings</button>
+                <button class="btn" id="btn-p-controls">Controls</button>
+                <button class="btn" id="btn-respawn">Return to the Heartspire</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Dialogs -->
+    <dialog id="dlg-journal" class="panel wide" aria-label="Journal">
+        <div class="dlg-head">
+            <div class="tabs" role="tablist">
+                <button role="tab" class="tab" data-tab="ach" aria-selected="true">Achievements</button>
+                <button role="tab" class="tab" data-tab="won" aria-selected="false">Wonders</button>
+                <button role="tab" class="tab" data-tab="map" aria-selected="false">Map</button>
+            </div>
+            <button class="icon-btn close" aria-label="Close" title="Close" data-close>&times;</button>
+        </div>
+        <div class="tab-body" id="tab-ach"></div>
+        <div class="tab-body" id="tab-won" hidden></div>
+        <div class="tab-body" id="tab-map" hidden><canvas id="map" width="900" height="900" aria-label="Map of the sky"></canvas></div>
+    </dialog>
+
+    <dialog id="dlg-settings" class="panel" aria-label="Settings">
+        <div class="dlg-head"><h2>Settings</h2><button class="icon-btn close" aria-label="Close" title="Close" data-close>&times;</button></div>
+        <div class="form">
+            <label>Mouse sensitivity <input type="range" id="s-sens" min="0.3" max="2.5" step="0.05"></label>
+            <label class="check"><input type="checkbox" id="s-invert"> Invert mouse pitch (pull back to climb)</label>
+            <label class="check"><input type="checkbox" id="s-autolevel"> Auto-level wings when not rolling</label>
+            <label class="check"><input type="checkbox" id="s-camroll"> Camera rolls with the dragon</label>
+            <label>Graphics quality
+                <select id="s-quality">
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="ultra">Ultra</option>
+                </select>
+            </label>
+            <label>Time of day
+                <select id="s-time">
+                    <option value="cycle">Cycle (day and night)</option>
+                    <option value="day">Always day</option>
+                    <option value="golden">Always golden hour</option>
+                    <option value="night">Always night</option>
+                </select>
+            </label>
+            <label>Volume <input type="range" id="s-vol" min="0" max="1" step="0.05"></label>
+            <label>Music <input type="range" id="s-music" min="0" max="1" step="0.05"></label>
+            <button class="btn danger" id="btn-reset">Reset all progress</button>
+        </div>
+    </dialog>
+
+    <dialog id="dlg-controls" class="panel" aria-label="Controls">
+        <div class="dlg-head"><h2>Controls</h2><button class="icon-btn close" aria-label="Close" title="Close" data-close>&times;</button></div>
+        <table class="controls">
+            <tr><th>Mouse</th><td>Steer: up/down pitches, left/right banks and turns</td></tr>
+            <tr><th>A / D</th><td>Roll</td></tr>
+            <tr><th>Q / E</th><td>Rudder (flat yaw)</td></tr>
+            <tr><th>Arrow keys</th><td>Steer without a mouse</td></tr>
+            <tr><th>W / S</th><td>Speed up / down</td></tr>
+            <tr><th>Space</th><td>Beat wings for speed (strength refills in rising air and whale wakes)</td></tr>
+            <tr><th>Shift</th><td>Air brake</td></tr>
+            <tr><th>C</th><td>Change camera</td></tr>
+            <tr><th>J / M</th><td>Journal / map</td></tr>
+            <tr><th>Esc</th><td>Pause and free the mouse</td></tr>
+        </table>
+        <p class="note">Click the sky to take the controls. Nothing can hurt your dragon; rock just bounces you off. Gamepads work too: left stick steers, bumpers roll, triggers speed up and brake, A beats the wings.</p>
+    </dialog>
+
+    <dialog id="dlg-info" class="panel" aria-label="About and privacy">
+        <div class="dlg-head"><h2>About Highwake</h2><button class="icon-btn close" aria-label="Close" title="Close" data-close>&times;</button></div>
+        <p>Ride a sky-dragon through the high islands. Find the four sky keys, wake the Crown, and see what else is out there.</p>
+        <p><strong>Privacy.</strong> Highwake uses Google Analytics to count visits and see which features get used, so the app can be improved. You don't need an account, and nothing you type into the app is collected. Your data will never be sold or given away.</p>
+    </dialog>
+
+    <dialog id="dlg-confirm" class="panel small" aria-label="Confirm">
+        <p id="confirm-text"></p>
+        <div class="row"><button class="btn danger" id="confirm-yes">Yes</button><button class="btn" id="confirm-no">Cancel</button></div>
+    </dialog>
+
+    <div id="ending" hidden><div class="ending-inner"><h2 id="ending-title"></h2><p id="ending-text"></p></div></div>
+    <noscript><p class="nojs">Highwake needs JavaScript and WebGL to fly.</p></noscript>
+    <script type="module" src="js/main.js"></script>
+</body>
+</html>
