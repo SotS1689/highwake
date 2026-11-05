@@ -12,7 +12,62 @@ export const shared = {
     uSunColor: { value: new THREE.Color(1, 1, 1) },
     uHaze: { value: new THREE.Color(0.7, 0.8, 0.9) },
     uShadow: { value: new THREE.Color(0.4, 0.45, 0.55) },
+    // island shadows: the nearest islands as sun-blocking discs (x, y, z, radius)
+    uIsl: { value: Array.from({ length: 16 }, () => new THREE.Vector4(0, -1e6, 0, 0)) },
+    uIslN: { value: 0 },
+    uDragonShade: { value: 1 },   // how much direct sun reaches the dragon (islands overhead)
 };
+
+// Islands block the sun as soft discs at their middle height; the shadow's edge softens
+// with distance from the island (the sun isn't a point). Cheap enough to run per pixel.
+export const ISLAND_SHADOW_GLSL = `
+    uniform vec4 uIsl[16]; uniform int uIslN;
+    float islandShadow(vec3 p, vec3 L){
+        if (L.y < 0.02) return 1.0;
+        float s = 1.0;
+        for (int i = 0; i < 16; i++) {
+            if (i >= uIslN) break;
+            vec4 c = uIsl[i];
+            float t = (c.y - p.y) / L.y;
+            if (t <= 0.0) continue;
+            vec2 q = p.xz + L.xz * t - c.xz;
+            float pen = c.w * 0.12 + t * 0.012;
+            s *= smoothstep(c.w * 0.72 - pen, c.w * 0.72 + pen, length(q));
+        }
+        return mix(1.0, s, smoothstep(0.02, 0.12, L.y));
+    }
+`;
+
+// Called every frame: hand the shaders the islands nearest the camera, and work out
+// (on the CPU, same maths) how shaded the dragon is.
+const _islTmp = [];
+export function updateIslandShadows(entities, cam, dragonPos, frame) {
+    const L = shared.uSunDir.value;
+    if (frame % 8 === 0 || !_islTmp.length) {
+        _islTmp.length = 0;
+        for (const e of entities) if (e.kind === "island" && (e.r || 0) > 120) _islTmp.push(e);
+        _islTmp.sort((a, b) => Math.hypot(a.pos[0] - cam.x, a.pos[2] - cam.z) - Math.hypot(b.pos[0] - cam.x, b.pos[2] - cam.z));
+        const n = Math.min(16, _islTmp.length);
+        for (let i = 0; i < n; i++) { const e = _islTmp[i]; shared.uIsl.value[i].set(e.pos[0], e.pos[1], e.pos[2], e.r); }
+        shared.uIslN.value = n;
+    }
+    let s = 1;
+    if (dragonPos && L.y > 0.02) {
+        for (let i = 0; i < shared.uIslN.value; i++) {
+            const c = shared.uIsl.value[i];
+            const t = (c.y - dragonPos.y) / L.y;
+            if (t <= 0) continue;
+            const d = Math.hypot(dragonPos.x + L.x * t - c.x, dragonPos.z + L.z * t - c.z);
+            const pen = c.w * 0.12 + t * 0.012, a = c.w * 0.72 - pen, b = c.w * 0.72 + pen;
+            const k = Math.min(1, Math.max(0, (d - a) / (b - a)));
+            s *= k * k * (3 - 2 * k);
+        }
+        const fade = Math.min(1, Math.max(0, (L.y - 0.02) / 0.1));
+        s = 1 + (s - 1) * fade;
+    }
+    // ease, so flying into shade is a smooth dimming rather than a switch
+    shared.uDragonShade.value += (Math.max(0.12, s) - shared.uDragonShade.value) * 0.15;
+}
 
 // Tileable fBm noise in four channels at different scales
 export function makeNoiseTexture(size = 256) {
@@ -84,7 +139,10 @@ export function textures() {
     TEX = {
         cliff: get("cliff_c.jpg"), cliffN: get("cliff_n.jpg", false), rock: get("rock_c.jpg"),
         grass: get("grass_c.jpg"), grassN: get("grass_n.jpg", false), tree: get("tree_atlas.png"), bark: get("bark_c.jpg"),
+        leaves: get("leaves.png"), undergrowth: get("undergrowth.png"),
     };
+    // the leaves atlas is addressed with glTF uvs (no flip), cells must not bleed into each other
+    for (const t of [TEX.leaves, TEX.undergrowth]) { t.flipY = false; t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; }
     TEX.tree.wrapS = TEX.tree.wrapT = THREE.ClampToEdgeWrapping;
     return TEX;
 }
@@ -112,10 +170,27 @@ const DETAIL_COLOR = `
     #ifdef BARK
     if (grassW < 0.99) cd = (triC(tBark, vVW, bw, 1.0/22.0) * 0.6 + triC(tBark, vVW, bw, 1.0/110.0) * 0.4) / vec3(0.199, 0.139, 0.086);
     #else
+    // a ragged grass line instead of the smooth per-vertex one; where grass is taken
+    // away the vertex green becomes bare, earthy rock
+    float nA = vn3(vVW * 0.045), nB = vn3(vVW * 0.0035 + 3.1);
+    float gV = grassW;
+    grassW = smoothstep(0.25, 0.75, grassW + (nA - 0.5) * 0.9);
+    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(0.45, 0.4, 0.15))) * vec3(1.05, 0.95, 0.8), clamp(gV - grassW, 0.0, 1.0));
     if (grassW < 0.99) {
-        cd = (triC(tCliff, vVW, bw, 1.0/9.0) * 0.55 + triC(tCliff, vVW, bw, 1.0/61.0) * 0.45) / vec3(0.19, 0.179, 0.135);
-        if (nW.y < -0.15) cd = mix(cd, triC(tRock, vVW, bw, 1.0/16.0) / vec3(0.084, 0.0785, 0.066), smoothstep(-0.15, -0.6, nW.y));
-        pert += triN(tCliffN, vVW, bw, 1.0/9.0) * (1.0 - grassW) * 0.9;
+        // de-tiling: the lookups are warped by low-frequency noise (so the grid of
+        // repeats bends away), the big layer is rotated against the small one, and the
+        // two are mixed in proportions that wander across the island
+        vec3 wp = vVW + (vec3(nA, 1.0 - nA, nB) - 0.5) * vec3(16.0, 11.0, 16.0) + vec3(nB * 23.0, 0.0, -nB * 17.0);
+        vec3 rp = vec3(0.788 * vVW.x - 0.616 * vVW.z, vVW.y * 0.93 + nA * 9.0, 0.616 * vVW.x + 0.788 * vVW.z);
+        float mixK = 0.35 + 0.4 * smoothstep(0.2, 0.8, nB + (nA - 0.5) * 0.3);
+        cd = (triC(tCliff, wp, bw, 1.0/9.0) * (1.0 - mixK) + triC(tCliff, rp, bw, 1.0/53.0) * mixK) / vec3(0.19, 0.179, 0.135);
+        if (nW.y < -0.15) cd = mix(cd, triC(tRock, wp.zyx, bw.zyx, 1.0/16.0) / vec3(0.084, 0.0785, 0.066), smoothstep(-0.15, -0.6, nW.y));
+        pert += triN(tCliffN, wp, bw, 1.0/9.0) * (1.0 - grassW) * 0.9;
+        // rock beds: irregular bands from noise stretched sideways (no fixed spacing, so
+        // they never read as ruled lines), tilting and pinching out across the face, and
+        // big warm/cool patches so a cliff isn't one flat brown
+        float bed = vn3(vec3(vVW.x * 0.004, vVW.y * 0.045 + nB * 2.5 + vVW.x * 0.006, vVW.z * 0.004));
+        cd *= (0.86 + 0.24 * bed) * mix(vec3(0.9, 0.95, 1.05), vec3(1.1, 0.98, 0.85), nB);
     }
     #endif
     if (grassW > 0.01) {
@@ -125,6 +200,7 @@ const DETAIL_COLOR = `
     }
     gd = pow(gd, vec3(1.5));
     vec3 det = mix(cd, gd, grassW);
+    det *= 1.0 - 0.3 * grassW * (1.0 - grassW) * 4.0;       // darker soil where grass meets rock
     det = mix(vec3(dot(det, vec3(0.3333))), det, 0.45);
     det = pow(det, vec3(1.25));
     diffuseColor.rgb *= clamp(det, 0.0, 3.0);
@@ -204,7 +280,9 @@ export function addWind(m, strength = 1, flutter = true) {
                 transformed.x += sway * k * 1.1;
                 transformed.z += cos(uTime * 1.05 + ip.z * 0.012) * gust * k * 0.6;
                 // leaves (the right half of the tree atlas) flutter on top of the sway
-                #if defined(USE_UV) && ${flutter ? 1 : 0}
+                #if defined(USE_UV) && ${flutter === "all" ? 2 : flutter ? 1 : 0} == 2
+                float leaf = 1.0;
+                #elif defined(USE_UV) && ${flutter ? 1 : 0}
                 float leaf = step(0.5, uv.x);
                 #else
                 float leaf = 0.0;
@@ -219,15 +297,18 @@ export function addWind(m, strength = 1, flutter = true) {
     return m;
 }
 
-export function foliageMaterial(glowColor = null) {
-    const m = glowMaterial({ roughness: 0.85, map: textures().tree, alphaTest: 0.5, side: THREE.DoubleSide }, glowColor);
+// map: the leaf texture (default: the old tree atlas, leaves on its right half);
+// with the Blender leaves atlas every vertex is leaf and flutters, and the cards are
+// anti-aliased with alpha-to-coverage where the scene is multisampled.
+export function foliageMaterial(glowColor = null, map = null) {
+    const m = glowMaterial({ roughness: 0.85, map: map || textures().tree, alphaTest: 0.5, side: THREE.DoubleSide, alphaToCoverage: !!map }, glowColor);
     const base = m.onBeforeCompile;
     m.onBeforeCompile = (sh, r) => {
         base(sh, r);
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
     };
-    m.customProgramCacheKey = () => "foliage" + (glowColor || "");
-    return addWind(m);
+    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas" : "");
+    return addWind(m, 1, map ? "all" : true);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
 

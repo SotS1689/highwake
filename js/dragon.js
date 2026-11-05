@@ -134,13 +134,15 @@ export function skinMaterial(membrane) {
     m.onBeforeCompile = (sh) => {
         Object.assign(sh.uniforms, m.userData.u, {
             uGlow: shared.uGlow, uTime: shared.uTime, uSunDir: shared.uSunDir, uSunColor: shared.uSunColor,
+            uDragonShade: shared.uDragonShade,
         });
         sh.vertexShader = sh.vertexShader
             .replace("#include <common>", "#include <common>\nattribute float glow;\nattribute vec3 skin;\nvarying float vGlow;\nvarying vec2 vM;\nvarying vec3 vSkin;\nvarying float vNy;")
             .replace("#include <beginnormal_vertex>", "#include <beginnormal_vertex>\nvNy = objectNormal.y;")
             .replace("#include <begin_vertex>", "#include <begin_vertex>\nvGlow = glow;\nvM = uv;\nvSkin = skin;");
         sh.fragmentShader = sh.fragmentShader
-            .replace("#include <common>", "#include <common>\n" + SKIN_GLSL)
+            .replace("#include <common>", "#include <common>\nuniform float uDragonShade;\n" + SKIN_GLSL)
+            .replace("#include <lights_fragment_end>", "#include <lights_fragment_end>\nreflectedLight.directDiffuse *= uDragonShade;\nreflectedLight.directSpecular *= uDragonShade;")
             .replace("#include <color_fragment>", `#include <color_fragment>
                 float sH = 0.5, edge = 0.0, vein = 0.0, thin = vSkin.y;
                 ${membrane ? `

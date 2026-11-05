@@ -2,7 +2,7 @@
 // mountain-islands on the horizon, and the day/night cycle that drives them all.
 
 import * as THREE from "three";
-import { shared, makeNoiseTexture, makePuffTexture, roughen, SHADER_END } from "./gfx.js";
+import { shared, makeNoiseTexture, makePuffTexture, roughen, SHADER_END, ISLAND_SHADOW_GLSL } from "./gfx.js";
 import { mulberry32 } from "./noise.js";
 
 // The cloud deck's shape, shared with the land below so the clouds cast shadows.
@@ -223,6 +223,7 @@ export class Sky {
             uNoise: { value: this.noiseTex }, uTime: shared.uTime, uSunDir: shared.uSunDir,
             uLit: { value: new THREE.Color() }, uShade: { value: new THREE.Color() }, uFar: { value: new THREE.Color() },
             uCam: { value: new THREE.Vector3() }, uSunColor: shared.uSunColor, uCover: { value: 0.555 },
+            uIsl: shared.uIsl, uIslN: shared.uIslN,
         };
         const mat = new THREE.ShaderMaterial({
             uniforms: this.seaU, fog: false, transparent: true, depthWrite: false,
@@ -231,6 +232,7 @@ export class Sky {
                 uniform sampler2D uNoise; uniform float uTime, uCover; uniform vec3 uSunDir, uLit, uShade, uFar, uCam, uSunColor;
                 varying vec3 vW;
                 ${CLOUD_GLSL}
+                ${ISLAND_SHADOW_GLSL}
                 void main(){
                     vec2 p = vW.xz;
                     float dist = length(vW - uCam);
@@ -248,6 +250,8 @@ export class Sky {
                     vec3 col = mix(uShade, uLit, clamp(pow(dif, 1.6)*0.8 + billow*0.35 - 0.1, 0., 1.));
                     vec3 v = normalize(uCam - vW);
                     col += uSunColor * pow(max(dot(reflect(-v, n), uSunDir), 0.), 12.) * 0.12 * sunUp;
+                    // the islands' shadows lying across the cloud tops
+                    col *= 1.0 - (1.0 - islandShadow(vec3(vW.x, 260.0, vW.z), uSunDir)) * 0.55;
                     float fogF = 1.0 - exp(-dist*0.000042);
                     col = mix(col, uFar, clamp(fogF, 0., 1.));
                     // thin edges of the cloud deck are darker underneath and see-through

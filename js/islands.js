@@ -4,6 +4,36 @@ import * as THREE from "three";
 import { entitySDF } from "./world.js";
 import { shared, glowMaterial, foliageMaterial, addWind, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES } from "./gfx.js";
 import { mulberry32 } from "./noise.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+// The Blender tree kit (tools/blender/build_trees.py): for each species and variant a
+// near version (bark + leaf cards) and a far version (a few big cards on the atlas).
+// ?trees=classic keeps the old code-built trees.
+async function loadTreeModels() {
+    if (new URLSearchParams(location.search).get("trees") === "classic") return null;
+    try {
+        const gltf = await new GLTFLoader().loadAsync(new URL("../models/trees.glb", import.meta.url).href);
+        const out = { canopy: [], spire: [] };
+        gltf.scene.traverse((o) => {
+            if (!o.isMesh) return;
+            const g = o.geometry;
+            for (const [from, to] of [["_GLOW", "glow"], ["_glow", "glow"], ["_NRM", "normal"], ["_nrm", "normal"]]) {
+                if (g.attributes[from]) { g.setAttribute(to, g.attributes[from]); g.deleteAttribute(from); }
+            }
+            if (!g.attributes.glow) g.setAttribute("glow", new THREE.BufferAttribute(new Float32Array(g.attributes.position.count), 1));
+            const m = o.name.match(/^(canopy|spire)(\d)_(bark|leaves|lo)$/);
+            if (!m) return;
+            g.computeBoundingSphere();
+            const list = out[m[1]], v = +m[2] - 1;
+            (list[v] ??= {})[m[3]] = g;
+        });
+        if (!out.canopy.length || !out.spire.length) throw new Error("tree kit incomplete");
+        return out;
+    } catch (e) {
+        console.warn("tree models failed, using the classic trees", e);
+        return null;
+    }
+}
 
 export async function buildIslands(scene, entities, onProgress) {
     const mat = glowMaterial({ roughness: 0.95 }, null, true, true);
@@ -56,7 +86,9 @@ export async function buildIslands(scene, entities, onProgress) {
         geo.computeBoundingSphere();
         return geo;
     };
-    const veg = new Vegetation(scene);
+    const [treeKit, rockKit] = await Promise.all([loadTreeModels(), loadRockModels()]);
+    const veg = new Vegetation(scene, treeKit);
+    veg.rocks = rockKit ? new Rocks(scene, rockKit, mat) : null;
     const farGeos = new Array(entities.length);
     for (let i = 0; i < entities.length; i++) {
         const e = entities[i], r = results[i];
@@ -74,8 +106,11 @@ export async function buildIslands(scene, entities, onProgress) {
         farGeos[i] = lo ? lo.geometry : m.geometry;
         e.mesh = m;
         veg.add(e, r.trees, r.vines);
+        if (veg.ground) veg.ground.add(e, r);
+        if (veg.rocks) veg.rocks.add(e, r);
     }
     veg.finish();
+    veg.ground?.finish();
     const falls = new Waterfalls(scene, entities);
     return { meshes, farGeos, veg, falls };
 }
@@ -173,43 +208,80 @@ function vineGeometry(L, seed, lo = false) {
 }
 
 class Vegetation {
-    constructor(scene) {
+    constructor(scene, kit) {
         this.scene = scene;
         this.geos = treeGeometries();
+        this.kit = kit;
         this.mat = foliageMaterial();
         // vine strands sway with the same wind as their leaves (foliageMaterial)
         this.glowMat = addWind(glowMaterial({ roughness: 0.8 }, "#ff9a5a"), 0.5, false);
         this.vineMat = addWind(glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff"), 1, false);
+        if (kit) {
+            this.leafMat = foliageMaterial(null, textures().leaves);
+            this.barkMat = addWind(glowMaterial({ roughness: 0.9, map: textures().bark }), 1, false);
+        }
         this.groups = [];
+        this.hiRange = 600;      // set from the quality level
+        this.groundRange = 300;  // ground cover (0: none)
+        this.ground = kit ? new Ground(scene) : null;
+        this.CHUNK = 320;        // forest patch size for the near trees
+    }
+
+    _instanced(geo, mat, list) {
+        const im = new THREE.InstancedMesh(geo, mat, list.length);
+        list.forEach((m, k) => im.setMatrixAt(k, m));
+        im.computeBoundingSphere();
+        this.scene.add(im);
+        return im;
     }
 
     add(e, trees, vines) {
-        const types = [[], [], []];
-        for (let i = 0; i < trees.length; i += 5) {
-            const t = trees[i + 4];
-            const ty = e.glowy ? (t < 0.45 ? 2 : t < 0.8 ? 0 : 1) : t < 0.66 ? 0 : t < 0.9 ? 1 : 2;
-            types[ty].push(trees[i], trees[i + 1], trees[i + 2], trees[i + 3]);
-        }
-        const group = { e, meshes: [] };
-        const geos = [this.geos.umbrella, this.geos.spire, this.geos.glowPlant];
+        const group = { e, meshes: [], chunks: [], lo: new Map() };
         const scaleFor = e.small ? 0.7 : 1;
         const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
         const rand = mulberry32((e.seed || 3) * 17);
-        types.forEach((arr, ty) => {
-            const n = arr.length / 4;
-            if (!n) return;
-            const im = new THREE.InstancedMesh(geos[ty], ty === 2 ? this.glowMat : this.mat, n);
-            for (let k = 0; k < n; k++) {
-                const sc = arr[k * 4 + 3] * scaleFor;
-                p.set(arr[k * 4] + e.pos[0], arr[k * 4 + 1] + e.pos[1] - 2, arr[k * 4 + 2] + e.pos[2]);
-                q.setFromEuler(new THREE.Euler((rand() - 0.5) * 0.12, rand() * 6.28, (rand() - 0.5) * 0.12));
-                s.set(sc, sc * (0.8 + rand() * 0.5), sc);
-                im.setMatrixAt(k, m4.compose(p, q, s));
+        // sort trees by kind (0 canopy, 1 spire, 2 glow plant) and, with the kit, variant;
+        // with the kit, canopy and spire trees are also gathered into forest patches
+        const sets = new Map(), chunks = new Map();
+        for (let i = 0; i < trees.length; i += 5) {
+            const t = trees[i + 4];
+            const ty = e.glowy ? (t < 0.45 ? 2 : t < 0.8 ? 0 : 1) : t < 0.66 ? 0 : t < 0.9 ? 1 : 2;
+            const sc = trees[i + 3] * scaleFor;
+            p.set(trees[i] + e.pos[0], trees[i + 1] + e.pos[1] - 2, trees[i + 2] + e.pos[2]);
+            q.setFromEuler(new THREE.Euler((rand() - 0.5) * 0.12, rand() * 6.28, (rand() - 0.5) * 0.12));
+            s.set(sc, sc * (0.8 + rand() * 0.5), sc);
+            const variants = this.kit && ty < 2 ? this.kit[ty ? "spire" : "canopy"].length : 1;
+            const key = ty * 10 + Math.min(variants - 1, Math.floor(rand() * variants));
+            if (!sets.has(key)) sets.set(key, []);
+            const list = sets.get(key);
+            const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length };
+            list.push(tree);
+            if (this.kit && ty < 2) {
+                const ck = Math.floor(trees[i] / this.CHUNK) + "," + Math.floor(trees[i + 2] / this.CHUNK);
+                if (!chunks.has(ck)) chunks.set(ck, { trees: [], center: new THREE.Vector3(), hi: false, meshes: null, r: 0 });
+                const c = chunks.get(ck);
+                c.trees.push(tree);
+                c.center.add(p);
             }
-            im.computeBoundingSphere();
-            this.scene.add(im);
+        }
+        // far versions: one instanced mesh per kind and variant for the whole island
+        for (const [key, list] of sets) {
+            const ty = Math.floor(key / 10), v = key % 10;
+            const kitTree = this.kit && ty < 2;
+            const geo = kitTree ? this.kit[ty ? "spire" : "canopy"][v].lo : [this.geos.umbrella, this.geos.spire, this.geos.glowPlant][ty];
+            const mat = ty === 2 ? this.glowMat : kitTree ? this.leafMat : this.mat;
+            const im = this._instanced(geo, mat, list.map((t) => t.m));
+            group.lo.set(key, im);
             group.meshes.push(im);
-        });
+        }
+        // near versions are built per forest patch the first time you come close
+        const tp = new THREE.Vector3();
+        for (const c of chunks.values()) {
+            c.center.multiplyScalar(1 / c.trees.length);
+            for (const t of c.trees) c.r = Math.max(c.r, c.center.distanceTo(tp.setFromMatrixPosition(t.m)));
+            c.r += 30;
+            group.chunks.push(c);
+        }
         // vines: each uses the nearer of two built lengths, scaled to fit
         const byVariant = [[], []];
         for (let k = 0; k < vines.length / 4; k++) {
@@ -224,30 +296,311 @@ class Vegetation {
         byVariant.forEach((list, vi) => {
             if (!list.length) return;
             for (const [V, out] of [[this.geos.vines[vi], group.vinesHi], [this.geos.vinesLo[vi], group.vinesLo]]) {
-                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.mat]]) {
-                    const im = new THREE.InstancedMesh(geo, mat, list.length);
-                    list.forEach((m, k) => im.setMatrixAt(k, m));
-                    im.computeBoundingSphere();
-                    this.scene.add(im);
-                    out.push(im);
-                }
+                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.mat]]) out.push(this._instanced(geo, mat, list));
             }
         });
         this.groups.push(group);
     }
 
-    finish() {}
+    // Shader warm-up: one hidden near tree of each kind (the loading screen's warm-up
+    // draws hidden things once), so the first forest you fly up to doesn't stall.
+    finish() {
+        if (!this.kit) return;
+        const m = new THREE.Matrix4().makeTranslation(0, -1e5, 0);
+        for (const sp of ["canopy", "spire"]) for (const v of this.kit[sp]) {
+            for (const [geo, mat] of [[v.bark, this.barkMat], [v.leaves, this.leafMat]]) this._instanced(geo, mat, [m]).visible = false;
+        }
+    }
 
-    // Hide forests on far islands (they're sub-pixel there anyway); vines get a detailed
-    // version up close, a light one at middle distance, and none beyond that.
+    _setHi(g, c, hi) {
+        c.hi = hi;
+        if (hi && !c.meshes) {
+            const byKey = new Map();
+            for (const t of c.trees) { if (!byKey.has(t.key)) byKey.set(t.key, []); byKey.get(t.key).push(t.m); }
+            c.meshes = [];
+            for (const [key, list] of byKey) {
+                const v = this.kit[Math.floor(key / 10) ? "spire" : "canopy"][key % 10];
+                c.meshes.push(this._instanced(v.bark, this.barkMat, list), this._instanced(v.leaves, this.leafMat, list));
+            }
+        }
+        if (c.meshes) for (const m of c.meshes) m.visible = hi;
+        // hide the far versions of these trees while the near ones show
+        const touched = new Set();
+        for (const t of c.trees) {
+            const im = g.lo.get(t.key);
+            im.setMatrixAt(t.index, hi ? ZERO : t.m);
+            touched.add(im);
+        }
+        for (const im of touched) im.instanceMatrix.needsUpdate = true;
+    }
+
+    // Hide forests on far islands (they're sub-pixel there anyway); trees near the camera
+    // use the detailed Blender models; vines get a detailed version up close, a light one
+    // at middle distance, and none beyond that.
     update(cam, range) {
         const VINE_HI = 900, VINE_LO = Math.min(range, 4500);
+        const HI = this.hiRange;
+        this.ground?.update(cam, this.groundRange);
+        this.rocks?.update(cam, range);
         for (const g of this.groups) {
             const d = Math.hypot(g.e.pos[0] - cam.x, g.e.pos[1] - cam.y, g.e.pos[2] - cam.z) - (g.e.r || 500);
             const vis = d < range;
             for (const m of g.meshes) m.visible = vis;
             for (const m of g.vinesHi) m.visible = d < VINE_HI;
             for (const m of g.vinesLo) m.visible = d >= VINE_HI && d < VINE_LO;
+            for (const c of g.chunks) {
+                const dc = c.center.distanceTo(cam) - c.r;
+                // a little hysteresis so a patch on the boundary doesn't flip every frame
+                const want = vis && (c.hi ? dc < HI * 1.15 : dc < HI);
+                if (want !== c.hi) this._setHi(g, c, want);
+            }
+        }
+    }
+}
+const ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
+
+// ---------------------------------------------------------------------------------
+// Ground cover: clumps of grass, ferns, flowers and low bushes on the grassy tops,
+// from the Blender undergrowth atlas. Only patches near the camera exist; each clump
+// shrinks into the ground toward the edge of the range, so they never pop in.
+
+const GROUND_CELLS = [[0, 0], [0.5, 0], [0, 0.5], [0.5, 0.5]];     // grass, fern, flowers, bush
+const GROUND_SIZE = [[7, 4.5], [9, 6.5], [6.5, 5], [10, 6]];         // width, height (m)
+
+function groundMaterial(range) {
+    const m = foliageMaterial(null, textures().undergrowth);
+    const base = m.onBeforeCompile;
+    m.onBeforeCompile = (sh, r) => {
+        base.call(m, sh, r);
+        sh.uniforms.uGroundRange = range;
+        sh.vertexShader = sh.vertexShader
+            .replace("#include <common>", "#include <common>\nattribute vec2 aCell;\nuniform float uGroundRange;")
+            .replace("#include <uv_vertex>", "#include <uv_vertex>\n#ifdef USE_MAP\nvMapUv += aCell;\n#endif")
+            .replace("#include <project_vertex>", `{
+                vec3 gp = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                float f = smoothstep(uGroundRange, uGroundRange * 0.7, distance(gp, cameraPosition));
+                // a gentle sway, more at the tips, then sink into the ground with distance
+                transformed.x += sin(uTime * 1.7 + gp.x * 0.05 + gp.z * 0.04) * position.y * 0.07;
+                transformed *= f;
+            }
+            #include <project_vertex>`);
+    };
+    const key = m.customProgramCacheKey;
+    m.customProgramCacheKey = () => key() + "ground";
+    return m;
+}
+
+function groundGeometry() {
+    // three crossed upright cards; normals lean up so a clump shades like the ground it's on
+    const parts = [];
+    for (let k = 0; k < 3; k++) {
+        parts.push({ geo: new THREE.PlaneGeometry(1, 1), matrix: M4([0, 0.5, 0], [0, (k * Math.PI) / 3, 0]), color: "#c9d4b4", uvRect: [0.004, 0.496, 0.496, 0.004], normalFrom: [0, -1.2, 0] });
+    }
+    return buildParts(parts);
+}
+
+class Ground {
+    constructor(scene) {
+        this.scene = scene;
+        this.range = { value: 300 };
+        this.mat = groundMaterial(this.range);
+        this.geo = groundGeometry();
+        this.CHUNK = 160;
+        this.chunks = [];
+    }
+
+    // Scatter clumps over the grassy, level parts of an island's surface mesh (local
+    // coordinates). Each surface vertex stands for about cell x cell square metres.
+    add(e, r) {
+        const P = r.position, N = r.normal, C = r.color;
+        const c = e.cell || 8, per = (c * c) / 45;
+        const rand = mulberry32((e.seed || 5) * 131 + 9);
+        const map = new Map();
+        const t = new THREE.Vector3(), b = new THREE.Vector3(), n = new THREE.Vector3();
+        for (let v = 0; v < P.length / 3; v++) {
+            const ny = N[v * 3 + 1];
+            if (ny < 0.8 || C[v * 3 + 1] - C[v * 3] < 0.03) continue;
+            let k = Math.floor(per) + (rand() < per % 1 ? 1 : 0);
+            if (!k) continue;
+            n.set(N[v * 3], ny, N[v * 3 + 2]);
+            t.set(1, 0, 0).addScaledVector(n, -n.x).normalize();
+            b.crossVectors(n, t);
+            // meadows: flowers gather in patches, ferns in the damper hollows
+            const meadow = Math.sin(P[v * 3] * 0.013 + e.pos[0]) * Math.sin(P[v * 3 + 2] * 0.011 - e.pos[2]);
+            while (k--) {
+                const du = (rand() - 0.5) * c, dv = (rand() - 0.5) * c;
+                const x = P[v * 3] + t.x * du + b.x * dv, y = P[v * 3 + 1] + t.y * du + b.y * dv - 0.4, z = P[v * 3 + 2] + t.z * du + b.z * dv;
+                const q = rand();
+                const ty = meadow > 0.35 ? (q < 0.55 ? 2 : 0) : q < 0.55 ? 0 : q < 0.75 ? 1 : q < 0.9 ? 3 : 2;
+                const key = Math.floor(x / this.CHUNK) + "," + Math.floor(z / this.CHUNK);
+                if (!map.has(key)) map.set(key, []);
+                map.get(key).push(x + e.pos[0], y + e.pos[1], z + e.pos[2], ty, 0.7 + rand() * 0.6, rand() * 6.283);
+            }
+        }
+        for (const list of map.values()) {
+            const data = new Float32Array(list);
+            const center = new THREE.Vector3();
+            for (let i = 0; i < data.length; i += 6) center.x += data[i], center.y += data[i + 1], center.z += data[i + 2];
+            center.multiplyScalar(6 / data.length);
+            let rad = 0;
+            for (let i = 0; i < data.length; i += 6) rad = Math.max(rad, Math.hypot(data[i] - center.x, data[i + 1] - center.y, data[i + 2] - center.z));
+            this.chunks.push({ data, center, r: rad + 10, mesh: null });
+        }
+    }
+
+    _build(ch) {
+        const d = ch.data, n = d.length / 6;
+        const im = new THREE.InstancedMesh(this.geo, this.mat, n);
+        const cell = new Float32Array(n * 2);
+        const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3(), Y = new THREE.Vector3(0, 1, 0);
+        for (let i = 0; i < n; i++) {
+            const ty = d[i * 6 + 3], sc = d[i * 6 + 4], [w, h] = GROUND_SIZE[ty];
+            p.set(d[i * 6], d[i * 6 + 1], d[i * 6 + 2]);
+            q.setFromAxisAngle(Y, d[i * 6 + 5]);
+            s.set(w * sc, h * sc, w * sc);
+            im.setMatrixAt(i, m4.compose(p, q, s));
+            cell[i * 2] = GROUND_CELLS[ty][0]; cell[i * 2 + 1] = GROUND_CELLS[ty][1];
+        }
+        im.geometry = this.geo.clone();     // own instance attribute per patch
+        im.geometry.setAttribute("aCell", new THREE.InstancedBufferAttribute(cell, 2));
+        im.computeBoundingSphere();
+        this.scene.add(im);
+        ch.mesh = im;
+    }
+
+    finish() {
+        // warm-up copy (drawn once while loading, then hidden)
+        const ch = { data: new Float32Array([0, -1e5, 0, 0, 1, 0]), center: new THREE.Vector3(0, -1e5, 0), r: 1, mesh: null };
+        this._build(ch);
+        ch.mesh.visible = false;
+    }
+
+    update(cam, range) {
+        this.range.value = range;
+        for (const ch of this.chunks) {
+            const d = ch.center.distanceTo(cam) - ch.r;
+            if (d < range) {
+                if (!ch.mesh) this._build(ch);
+                ch.mesh.visible = true;
+            } else if (ch.mesh) {
+                ch.mesh.visible = false;
+                // free patches left far behind
+                if (d > range * 3) { this.scene.remove(ch.mesh); ch.mesh.geometry.dispose(); ch.mesh.dispose(); ch.mesh = null; }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Rocks from the Blender rock kit (tools/blender/build_rocks.py): mossy boulders half
+// sunk into the island tops and shards hanging from the undersides. They share the island material, so the cliff detail, strata and
+// moss carry straight across. Detailed copies near the camera, light ones further out.
+
+async function loadRockModels() {
+    if (new URLSearchParams(location.search).get("trees") === "classic") return null;
+    try {
+        const gltf = await new GLTFLoader().loadAsync(new URL("../models/rocks.glb", import.meta.url).href);
+        const out = {};
+        gltf.scene.traverse((o) => {
+            if (!o.isMesh) return;
+            const g = o.geometry;
+            for (const k of ["_GLOW", "_glow"]) if (g.attributes[k]) { g.setAttribute("glow", g.attributes[k]); g.deleteAttribute(k); }
+            if (!g.attributes.glow) g.setAttribute("glow", new THREE.BufferAttribute(new Float32Array(g.attributes.position.count), 1));
+            const m = o.name.match(/^(\w+?)_(hi|lo)$/);
+            if (m) (out[m[1]] ??= {})[m[2]] = g;
+        });
+        if (!out.boulder1 || !out.shard) throw new Error("rock kit incomplete");
+        return out;
+    } catch (e) {
+        console.warn("rock models failed, islands go without", e);
+        return null;
+    }
+}
+
+class Rocks {
+    constructor(scene, kit, mat) {
+        this.scene = scene;
+        this.kit = kit;
+        this.mat = mat;
+        // shards hang in the shadow of the island above, which the renderer doesn't cast:
+        // same rock material, with most of the direct sunlight taken away
+        this.shadeMat = glowMaterial({ roughness: 0.95 }, null, false, true);
+        const base = this.shadeMat.onBeforeCompile;
+        this.shadeMat.onBeforeCompile = (sh, r) => {
+            base.call(this.shadeMat, sh, r);
+            sh.fragmentShader = sh.fragmentShader.replace("#include <lights_fragment_end>",
+                "#include <lights_fragment_end>\nreflectedLight.directDiffuse *= 0.12;\nreflectedLight.directSpecular *= 0.12;");
+        };
+        const key = this.shadeMat.customProgramCacheKey;
+        this.shadeMat.customProgramCacheKey = () => key() + "shaded";
+        this.groups = [];
+        this.hiRange = 700;
+    }
+
+    add(e, r) {
+        if (e.kind === "bridge") return;
+        const P = r.position, N = r.normal, C = r.color;
+        const c = e.cell || 8;
+        const rand = mulberry32((e.seed || 7) * 977 + 3);
+        const lists = { boulder1: [], boulder2: [], shard: [] };
+        const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), q2 = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3(), n = new THREE.Vector3();
+        const Y = new THREE.Vector3(0, 1, 0), DOWN = new THREE.Vector3(0, -1, 0), O = new THREE.Vector3(...e.pos);
+        const k = e.small ? 0.6 : 1;
+        // each rock takes the colour of the island where it sits (relative to the kit's
+        // own rock colour), so it belongs to that cliff; boulders on grass keep their moss
+        const BASE = [0.32, 0.27, 0.21];
+        const tint = (v, grey) => {
+            const cr = C[v * 3], cg = C[v * 3 + 1], cb = C[v * 3 + 2];
+            if (grey) return new THREE.Color(0.8, 0.8, 0.8);    // the ground there is grass, not rock
+            return new THREE.Color(Math.min(1.6, cr / BASE[0]), Math.min(1.6, cg / BASE[1]), Math.min(1.6, cb / BASE[2]));
+        };
+        for (let v = 0; v < P.length / 3; v++) {
+            n.set(N[v * 3], N[v * 3 + 1], N[v * 3 + 2]);
+            const x = P[v * 3], y = P[v * 3 + 1], z = P[v * 3 + 2];
+            // rocks gather in outcrops rather than spreading evenly
+            const clump = Math.max(0, Math.sin(x * 0.013 + z * 0.011 + (e.seed || 0)) * Math.sin(z * 0.015 - y * 0.009));
+            const area = c * c;
+            if (n.y > 0.75) {
+                if (rand() > (area / 2500) * clump * 2.5) continue;
+                const sc = (4 + rand() * rand() * 14) * k;
+                // half sunk, leaning with the slope
+                p.set(x, y - sc * 0.3, z).add(O);
+                q.setFromUnitVectors(Y, n.clone().lerp(Y, 0.5).normalize()).multiply(q2.setFromAxisAngle(Y, rand() * 6.28));
+                s.set(sc * (0.8 + rand() * 0.4), sc * (0.7 + rand() * 0.5), sc * (0.8 + rand() * 0.4));
+                lists[rand() < 0.5 ? "boulder1" : "boulder2"].push([m4.compose(p, q, s).clone(), tint(v, true)]);
+            } else if (n.y < -0.45) {
+                if (rand() > (area / 2600) * (0.3 + clump) * 1.5) continue;
+                // a shard hanging point-down from the underside, its root buried in the rock
+                const sc = (16 + rand() * rand() * 44) * k;
+                p.set(x, y, z).addScaledVector(n, -sc * 0.5).add(O);
+                q.setFromUnitVectors(Y, DOWN.clone().lerp(n, 0.3).normalize()).multiply(q2.setFromAxisAngle(Y, rand() * 6.28));
+                s.set(sc * 1.3, sc * (1 + rand() * 0.6), sc * 1.3);
+                lists.shard.push([m4.compose(p, q, s).clone(), tint(v, false)]);
+            }
+        }
+        const g = { e, hi: [], lo: [], state: -1 };
+        for (const [name, list] of Object.entries(lists)) {
+            if (!list.length || !this.kit[name]) continue;
+            for (const lvl of ["hi", "lo"]) {
+                const im = new THREE.InstancedMesh(this.kit[name][lvl], name === "shard" ? this.shadeMat : this.mat, list.length);
+                list.forEach(([m, col], j) => { im.setMatrixAt(j, m); im.setColorAt(j, col); });
+                im.computeBoundingSphere();
+                im.visible = false;
+                this.scene.add(im);
+                g[lvl].push(im);
+            }
+        }
+        this.groups.push(g);
+    }
+
+    update(cam, range) {
+        for (const g of this.groups) {
+            const d = Math.hypot(g.e.pos[0] - cam.x, g.e.pos[1] - cam.y, g.e.pos[2] - cam.z) - (g.e.r || 500);
+            const st = d < this.hiRange ? 0 : d < Math.min(range, 7000) ? 1 : 2;
+            if (st === g.state) continue;
+            g.state = st;
+            for (const m of g.hi) m.visible = st === 0;
+            for (const m of g.lo) m.visible = st === 1;
         }
     }
 }

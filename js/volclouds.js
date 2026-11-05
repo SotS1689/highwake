@@ -11,7 +11,7 @@
 import * as THREE from "three";
 import { Pass, FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 import { CLOUD_GLSL } from "./sky.js";
-import { shared } from "./gfx.js";
+import { shared, ISLAND_SHADOW_GLSL } from "./gfx.js";
 
 export const DECK_BASE = -140, DECK_TOP = 330;
 
@@ -25,6 +25,7 @@ const shader = {
         uLit: { value: new THREE.Color() }, uShade: { value: new THREE.Color() }, uFarCol: { value: new THREE.Color() },
         uHaze: shared.uHaze, uSteps: { value: 32 }, uFrame: { value: 0 },
         tCloud: { value: null }, uTexel: { value: new THREE.Vector2() },
+        uIsl: shared.uIsl, uIslN: shared.uIslN,
     },
     vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
     fragmentShader: /* glsl */ `
@@ -34,6 +35,7 @@ const shader = {
         uniform float uNear, uFar, uTime, uCover, uFrame; uniform int uSteps;
         varying vec2 vUv;
         ${CLOUD_GLSL}
+        ${ISLAND_SHADOW_GLSL}
         const float YB = ${DECK_BASE.toFixed(1)}, YT = ${DECK_TOP.toFixed(1)};
         float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
@@ -85,6 +87,9 @@ const shader = {
                 float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy + uFrame * 5.588238, vec2(0.06711056, 0.00583715))));
                 float sunUp = clamp(uSunDir.y * 3.0 + 0.2, 0.0, 1.0);
                 float phase = pow(max(dot(D, uSunDir), 0.0), 8.0) * 0.8 + pow(max(dot(D, uSunDir), 0.0), 2.0) * 0.25;
+                // island shadow on this ray's stretch of cloud, taken where it enters the tops
+                vec3 pe = uCam + D * max(t0, 0.0);
+                float isl = 1.0 - (1.0 - islandShadow(vec3(pe.x, 260.0, pe.z), uSunDir)) * 0.55;
                 for (int i = 0; i < 96; i++) {
                     if (i >= N || T < 0.02) break;
                     float s0 = (float(i) + jit) / float(N);
@@ -101,6 +106,7 @@ const shader = {
                         float lit = pow(hgt, 0.8) * (0.75 + 0.25 * sunUp);
                         vec3 c = mix(uShade, uLit, clamp(lit * 0.9 + 0.1, 0.0, 1.0));
                         c += uSunColor * phase * (0.35 + 0.65 * (1.0 - d)) * sunUp * 0.6;
+                        c *= isl;
                         float fogF = 1.0 - exp(-dist * 0.000042);
                         c = mix(c, uFarCol, clamp(fogF, 0.0, 1.0));
                         float sigma = 0.03 * d * (0.5 + 0.5 * det) + 0.004 * d;
@@ -129,6 +135,57 @@ const shader = {
         }`,
 };
 
+// Temporal resolve: the march uses few samples with a dither that changes every frame,
+// which on its own reads as flicker. Each frame is blended with the previous result,
+// reprojected to where that bit of cloud was last frame and clamped to the colours
+// around it now (so moving edges don't ghost). The noise averages out over ~10 frames.
+const resolveShader = {
+    uniforms: {
+        tCur: { value: null }, tHist: { value: null }, tDepth: { value: null },
+        uInvProj: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() },
+        uPrevVP: { value: new THREE.Matrix4() }, uCam: { value: new THREE.Vector3() },
+        uNear: { value: 1 }, uFar: { value: 1000 }, uTexel: { value: new THREE.Vector2() }, uReset: { value: 1 },
+    },
+    vertexShader: shader.vertexShader,
+    fragmentShader: /* glsl */ `
+        #include <packing>
+        uniform sampler2D tCur, tHist, tDepth; uniform mat4 uInvProj, uCamWorld, uPrevVP;
+        uniform vec3 uCam; uniform float uNear, uFar, uReset; uniform vec2 uTexel;
+        varying vec2 vUv;
+        const float YB = ${DECK_BASE.toFixed(1)}, YT = ${DECK_TOP.toFixed(1)};
+        void main(){
+            vec4 cur = texture2D(tCur, vUv);
+            vec4 mn = cur, mx = cur, m1 = vec4(0.0), m2 = vec4(0.0);
+            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+                vec4 c = texture2D(tCur, vUv + vec2(float(x), float(y)) * uTexel);
+                mn = min(mn, c); mx = max(mx, c); m1 += c; m2 += c * c;
+            }
+            // variance clip: tighter than min/max, so stale cloud can't linger
+            m1 /= 9.0; vec4 sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+            mn = max(mn, m1 - 1.25 * sd); mx = min(mx, m1 + 1.25 * sd);
+            if (uReset > 0.5) { gl_FragColor = cur; return; }
+            // where was this pixel's cloud last frame? use the point where the ray enters the
+            // deck (or the scene surface, if nearer) as the cloud's representative depth
+            vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+            vec3 vdir = normalize(vp.xyz / vp.w);
+            vec3 D = normalize(mat3(uCamWorld) * vdir);
+            float depth = texture2D(tDepth, vUv).x;
+            float tScene = depth >= 0.99999 ? 1e9 : perspectiveDepthToViewZ(depth, uNear, uFar) / vdir.z;
+            float t0 = 400.0;
+            if (abs(D.y) > 1e-4) {
+                float ta = (YB - uCam.y) / D.y, tb = (YT - uCam.y) / D.y;
+                float te = max(min(ta, tb), 0.0);
+                if (max(ta, tb) > 0.0) t0 = max(te, 400.0);
+            }
+            float t = min(min(t0, tScene), 60000.0);
+            vec4 pc = uPrevVP * vec4(uCam + D * t, 1.0);
+            vec2 puv = pc.xy / pc.w * 0.5 + 0.5;
+            if (pc.w <= 0.0 || any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)))) { gl_FragColor = cur; return; }
+            vec4 hist = clamp(texture2D(tHist, puv), mn, mx);
+            gl_FragColor = mix(hist, cur, 0.12);
+        }`,
+};
+
 export class VolumetricClouds extends Pass {
     constructor(sky, camera) {
         super();
@@ -140,7 +197,7 @@ export class VolumetricClouds extends Pass {
         });
         const u = (this.u = THREE.UniformsUtils.clone(shader.uniforms));
         // keep the shared (live) uniforms shared
-        for (const k of ["uTime", "uSunDir", "uSunColor", "uHaze"]) u[k] = shader.uniforms[k];
+        for (const k of ["uTime", "uSunDir", "uSunColor", "uHaze", "uIsl", "uIslN"]) u[k] = shader.uniforms[k];
         u.uNoise.value = sky.noiseTex;
         u.uCover = sky.seaU.uCover;
         this.needsSwap = false;
@@ -148,12 +205,22 @@ export class VolumetricClouds extends Pass {
         this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
         this.scale = 0.5;
         this.frame = 0;
+        const ru = (this.ru = THREE.UniformsUtils.clone(resolveShader.uniforms));
+        this.resolveQuad = new FullScreenQuad(new THREE.ShaderMaterial({ ...resolveShader, uniforms: ru, depthTest: false, depthWrite: false }));
+        const opt = { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
+        this.hist = [new THREE.WebGLRenderTarget(1, 1, opt), new THREE.WebGLRenderTarget(1, 1, opt)];
+        this.prevVP = new THREE.Matrix4();
+        this.reset = true;
     }
 
     setSteps(n) { this.u.uSteps.value = n; }
 
     setSize(w, h) {
-        this.target.setSize(Math.max(1, Math.round(w * this.scale)), Math.max(1, Math.round(h * this.scale)));
+        const cw = Math.max(1, Math.round(w * this.scale)), ch = Math.max(1, Math.round(h * this.scale));
+        this.target.setSize(cw, ch);
+        for (const t of this.hist) t.setSize(cw, ch);
+        this.ru.uTexel.value.set(1 / cw, 1 / ch);
+        this.reset = true;
         this.u.uTexel.value.set(1 / w, 1 / h);
     }
 
@@ -171,9 +238,24 @@ export class VolumetricClouds extends Pass {
         u.uFrame.value = this.frame = (this.frame + 1) % 64;
         renderer.setRenderTarget(this.target);
         this.marchQuad.render(renderer);
+
+        const r = this.ru, [read, write] = this.hist;
+        r.tCur.value = this.target.texture; r.tHist.value = read.texture; r.tDepth.value = readBuffer.depthTexture;
+        r.uInvProj.value.copy(cam.projectionMatrixInverse); r.uCamWorld.value.copy(cam.matrixWorld);
+        r.uCam.value.copy(cam.position); r.uNear.value = cam.near; r.uFar.value = cam.far;
+        r.uPrevVP.value.copy(this.prevVP);
+        r.uReset.value = this.reset ? 1 : 0;
+        renderer.setRenderTarget(write);
+        this.resolveQuad.render(renderer);
+        this.hist.reverse();
+        this.prevVP.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+        this.reset = false;
     }
 
-    get texture() { return this.target.texture; }
+    get texture() { return this.hist[0].texture; }
 
-    dispose() { this.marchQuad.material.dispose(); this.marchQuad.dispose(); this.target.dispose(); }
+    dispose() {
+        this.marchQuad.material.dispose(); this.marchQuad.dispose(); this.target.dispose();
+        this.resolveQuad.material.dispose(); this.resolveQuad.dispose(); for (const t of this.hist) t.dispose();
+    }
 }

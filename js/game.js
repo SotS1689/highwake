@@ -5,7 +5,7 @@ import * as THREE from "three";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { buildWorld, worldSDF, GATES, WONDERS, THERMALS, BELL, CHIME_ORDER, CROWN, SPAWN } from "./world.js";
-import { shared, texturesReady } from "./gfx.js";
+import { shared, texturesReady, updateIslandShadows } from "./gfx.js";
 import { Sky } from "./sky.js";
 import { buildIslands } from "./islands.js";
 import { Land, generateLandAsync } from "./land.js";
@@ -43,10 +43,10 @@ const SAVE_KEY = "highwake.save.v1";
 
 // msaa: anti-aliasing samples for the scene; cloudScale: size of the cloud raymarch
 const QUALITY = {
-    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0, msaa: 0 },
-    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0, msaa: 2 },
-    high: { px: 1.25, bloom: true, veg: 9000, shadow: 2048, rays: 32, clouds: 24, cloudScale: 0.4, msaa: 2 },
-    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 64, clouds: 40, cloudScale: 0.5, msaa: 4 },
+    low: { ground: 0, treeHi: 250, px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0, msaa: 0 },
+    medium: { ground: 220, treeHi: 450, px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0, msaa: 2 },
+    high: { ground: 320, treeHi: 650, px: 1.25, bloom: true, veg: 9000, shadow: 2048, rays: 32, clouds: 24, cloudScale: 0.4, msaa: 2 },
+    ultra: { ground: 480, treeHi: 1000, px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 64, clouds: 40, cloudScale: 0.5, msaa: 4 },
 };
 
 export class Game {
@@ -89,6 +89,8 @@ export class Game {
         onProgress(0.03, "Raising the islands…");
         const isl = await buildIslands(this.scene, this.entities, (f) => onProgress(0.05 + f * 0.8, "Raising the islands…"));
         this.veg = isl.veg;
+        this.veg.hiRange = (QUALITY[this.settings.quality] || QUALITY.high).treeHi;
+        this.veg.groundRange = (QUALITY[this.settings.quality] || QUALITY.high).ground;
         // the horizon giants are 40-60 km away: the coarse island copies are plenty
         this.sky.setFarGeometries(this.entities.map((e, i) => ({ geo: isl.farGeos[i], r: e.r, big: e.kind === "island" && !e.small })).filter((g) => g.big));
         this.falls = isl.falls;
@@ -218,6 +220,7 @@ export class Game {
         this.renderer.setPixelRatio(px);
         this.px = px;
         this.vegRange = q.veg;
+        if (this.veg) { this.veg.hiRange = q.treeHi; this.veg.groundRange = q.ground; }
         this.vessel?.dragon.setShadows(this.sky.sun, q.shadow);
         if (q.bloom && !this.composer) {
             // the scene is drawn once into an HDR target (with depth, for the clouds and haze);
@@ -244,7 +247,7 @@ export class Game {
         this.cine?.setQuality(q);
         // volumetric clouds replace the flat cloud deck where the GPU can afford them
         const vol = q.bloom && q.clouds > 0;
-        if (this.vclouds) { this.vclouds.enabled = vol; this.vclouds.setSteps(q.clouds || 24); }
+        if (this.vclouds) { this.vclouds.enabled = vol; this.vclouds.reset = true; this.vclouds.setSteps(q.clouds || 24); }
         this.sky.sea.visible = !vol;
         this.useComposer = q.bloom;
         this.resize();
@@ -585,6 +588,7 @@ export class Game {
         const playerPos = flying || this.state === "paused" ? this.vessel.pos : this.camera.position;
         this.sky.update(this.state === "paused" ? 0 : dt, this.camera);
         this.vessel.dragon.aimLights(this.sky.sun, this.sky.hemi);
+        updateIslandShadows(this.entities, this.camera.position, this.vessel.pos, (this._frameN = (this._frameN || 0) + 1));
         this.land.update(this.camera);
         if (this.state !== "paused") {
             const strike = this.landmarks.update(dt, this.time, playerPos);
