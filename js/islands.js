@@ -2,7 +2,7 @@
 
 import * as THREE from "three";
 import { entitySDF } from "./world.js";
-import { shared, glowMaterial, foliageMaterial, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES } from "./gfx.js";
+import { shared, glowMaterial, foliageMaterial, addWind, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES } from "./gfx.js";
 import { mulberry32 } from "./noise.js";
 
 export async function buildIslands(scene, entities, onProgress) {
@@ -160,8 +160,9 @@ class Vegetation {
         this.scene = scene;
         this.geos = treeGeometries();
         this.mat = foliageMaterial();
-        this.glowMat = glowMaterial({ roughness: 0.8 }, "#ff9a5a");
-        this.vineMat = glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff");
+        // vine strands sway with the same wind as their leaves (foliageMaterial)
+        this.glowMat = addWind(glowMaterial({ roughness: 0.8 }, "#ff9a5a"), 0.5, false);
+        this.vineMat = addWind(glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff"), 1, false);
         this.groups = [];
     }
 
@@ -234,7 +235,7 @@ class Vegetation {
 export class Waterfalls {
     constructor(scene, entities) {
         this.list = [];
-        this.u = { uTime: shared.uTime, uSunColor: shared.uSunColor, uHaze: shared.uHaze, uGlow: shared.uGlow };
+        this.u = { uTime: shared.uTime, uSunColor: shared.uSunColor, uHaze: shared.uHaze, uGlow: shared.uGlow, uSunDir: shared.uSunDir };
         this.mat = new THREE.ShaderMaterial({
             uniforms: this.u, transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false,
             vertexShader: `
@@ -242,23 +243,38 @@ export class Waterfalls {
                 attribute float aDir;
                 void main(){ vUv = uv; vLen = aLen; vDir = aDir; vec4 mv = modelViewMatrix * vec4(position,1.); vDist = length(mv.xyz); gl_Position = projectionMatrix * mv; }`,
             fragmentShader: `
-                uniform float uTime, uGlow; uniform vec3 uSunColor, uHaze;
+                uniform float uTime, uGlow; uniform vec3 uSunColor, uHaze, uSunDir;
                 varying vec2 vUv; varying float vLen; varying float vDist; varying float vDir;
                 float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
                 float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
                 void main(){
                     float along = vUv.y * vLen;           // metres from the lip
                     float x = vUv.x;
-                    float flow = along * 0.035 - uTime * 1.6 * vDir;
-                    float s = n(vec2(x*22., flow)) * 0.6 + n(vec2(x*55., flow*2.3)) * 0.4;
-                    float edge = smoothstep(0.0, 0.18, x) * smoothstep(1.0, 0.82, x);
+                    // water accelerates as it falls, so the streaks stretch: distance grows with
+                    // the square of time, so time-from-the-lip goes with its square root
+                    float ft = sqrt(max(along, 0.0)) * 0.9;
+                    float flow = (vDir > 0.0 ? ft : along * 0.035) - uTime * 1.6 * vDir;
+                    float s = n(vec2(x * 18., flow)) * 0.5 + n(vec2(x * 47., flow * 1.7 + 3.)) * 0.3 + n(vec2(x * 110., flow * 3.1 + 7.)) * 0.2;
+                    // the sheet is solid at the lip and tears into strands and spray lower down
+                    float tear = smoothstep(0.02, 0.55, vUv.y);
+                    float rag = n(vec2(x * 9., ft * 0.6 - uTime * 0.5)) * 0.12;
+                    float edge = smoothstep(0.0, 0.16 + rag + tear * 0.12, x) * smoothstep(1.0, 0.84 - rag - tear * 0.12, x);
                     float fade = 1.0 - smoothstep(0.35, 1.0, vUv.y);
-                    float a = smoothstep(0.3, 0.75, s) * edge * fade;
-                    a = max(a, edge * fade * 0.25);
-                    vec3 col = mix(vec3(0.75,0.86,0.95), vec3(1.0), s) * (0.55 + 0.45*uSunColor);
-                    col += vec3(0.3,0.9,1.0) * uGlow * 0.25 * s;
-                    col = mix(col, uHaze, clamp(1.0 - exp(-vDist*0.00008), 0., 1.));
-                    gl_FragColor = vec4(col, a * 0.85);
+                    float a = smoothstep(0.3 + 0.28 * tear, 0.78, s);
+                    a = max(a, (1.0 - smoothstep(0.0, 0.07, vUv.y)) * 0.85);       // glassy lip
+                    a = max(a, 0.18 * (1.0 - tear)) * edge * fade;
+                    // deep green-blue where it's thick, white foam on the fast streaks
+                    float foam = smoothstep(0.55, 0.92, s) + (1.0 - smoothstep(0.0, 0.05, vUv.y)) * 0.6;
+                    vec3 col = mix(vec3(0.32, 0.52, 0.6), vec3(1.0), clamp(foam, 0.0, 1.0));
+                    float sunUp = clamp(uSunDir.y * 3.0 + 0.3, 0.0, 1.0);
+                    col *= 0.5 + 0.5 * uSunColor;
+                    // sun glints sparkling down the sheet
+                    vec2 gc = vec2(x * 160., flow * 26.);
+                    float glint = step(0.992, h(floor(gc))) * smoothstep(0.5, 0.0, length(fract(gc) - 0.5)) * sunUp;
+                    col += uSunColor * glint * 3.0;
+                    col += vec3(0.3, 0.9, 1.0) * uGlow * 0.3 * s;
+                    col = mix(col, uHaze, clamp(1.0 - exp(-vDist * 0.00008), 0., 1.));
+                    gl_FragColor = vec4(col, a * 0.88);
                     ${SHADER_END}
                 }`,
         });
@@ -272,7 +288,68 @@ export class Waterfalls {
             if (e.risingFall) this._rising(e);
         }
         this.mesh = this._build(scene);
+        this.spray = this._buildSpray(scene);
     }
+
+    // Spray: droplets peel off each falling sheet and drift outward as they fall,
+    // growing into mist. Animated entirely in the vertex shader.
+    _buildSpray(scene) {
+        const PER = 260;
+        const falls = this.list.filter((f) => !f.rising);
+        const n = falls.length * PER;
+        const lip = new Float32Array(n * 3), frame = new Float32Array(n * 4), seed = new Float32Array(n * 4);
+        const rand = mulberry32(77);
+        falls.forEach((f, fi) => {
+            const L = f.pts[3];
+            for (let k = 0; k < PER; k++) {
+                const i = fi * PER + k;
+                lip.set([L.x, L.y, L.z], i * 3);
+                frame.set([f.normal.x, f.normal.z, f.w, f.len], i * 4);
+                seed.set([rand(), rand(), rand(), rand()], i * 4);
+            }
+        });
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.BufferAttribute(lip, 3));
+        g.setAttribute("aFrame", new THREE.BufferAttribute(frame, 4));
+        g.setAttribute("aSeed", new THREE.BufferAttribute(seed, 4));
+        g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+        this.sprayU = { uTime: shared.uTime, uSunColor: shared.uSunColor, uHaze: shared.uHaze, uGlow: shared.uGlow, uPx: { value: 1 } };
+        const m = new THREE.Points(g, new THREE.ShaderMaterial({
+            uniforms: this.sprayU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+            vertexShader: `
+                attribute vec4 aFrame, aSeed; uniform float uTime, uPx; varying float vA; varying float vDist;
+                void main(){
+                    float life = fract(aSeed.x + uTime * (0.05 + 0.04 * aSeed.y));
+                    float fall = life * life * aFrame.w * 0.55;           // accelerating
+                    vec3 out_ = vec3(aFrame.x, 0.0, aFrame.y);
+                    vec3 side = vec3(-aFrame.y, 0.0, aFrame.x);
+                    float spread = 1.0 + fall * 0.02;
+                    vec3 p = position + vec3(0.0, -fall, 0.0)
+                        + out_ * (8.0 + fall * (0.04 + 0.08 * aSeed.z))
+                        + side * (aSeed.w - 0.5) * aFrame.z * spread;
+                    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+                    vDist = -mv.z;
+                    gl_Position = projectionMatrix * mv;
+                    vA = smoothstep(0.0, 0.08, life) * (1.0 - smoothstep(0.55, 1.0, life)) * smoothstep(9000.0, 1500.0, vDist);
+                    gl_PointSize = clamp((6.0 + fall * 0.08) * 260.0 * uPx / max(vDist, 1.0), 1.0, 48.0);
+                }`,
+            fragmentShader: `
+                uniform vec3 uSunColor, uHaze; uniform float uGlow; varying float vA; varying float vDist;
+                void main(){
+                    float d = length(gl_PointCoord - 0.5);
+                    float a = smoothstep(0.5, 0.0, d) * vA * 0.35;
+                    vec3 c = mix(vec3(0.9, 0.95, 1.0) * (0.5 + 0.6 * uSunColor), uHaze, clamp(vDist / 12000.0, 0.0, 1.0)) + vec3(0.2, 0.7, 0.9) * uGlow * 0.2;
+                    gl_FragColor = vec4(c * a, a);
+                    ${SHADER_END}
+                }`,
+        }));
+        m.frustumCulled = false;
+        m.renderOrder = 6;
+        scene.add(m);
+        return m;
+    }
+
+    setPixelScale(px) { if (this.sprayU) this.sprayU.uPx.value = px; }
 
     _surfaceY(e, x, z) {
         for (let y = e.h * 1.2; y > -e.h * 2; y -= 3) if (entitySDF(e, x, y, z) < 0) return y;

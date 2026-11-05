@@ -56,6 +56,10 @@ Push the folder to a GitHub repo under SotS1689 and turn on GitHub Pages. The li
 - `js/landgen.js` + `js/land.worker.js`: generates the land far below (mountains, flood-filled lakes, rivers routed downhill, a coast) into a heightmap in a worker.
 - `js/land.js`: draws that land with water glints, cloud shadows and haze.
 - `js/sky.js`: sky dome, sun, moon, stars, aurora, the broken cloud deck, billboard clouds, horizon giants and the day/night cycle.
+- `js/volclouds.js`: the volumetric sea of clouds and low haze (a post pass that raymarches the deck using the scene's depth).
+- `js/cinematic.js`: sun shafts and the time-of-day colour grade.
+- `js/dragonModel.js`: loads the Blender-built dragon (`models/dragon.glb`) and drives its animations; `js/dragon.js` is the code-built fallback and owns the skin shader.
+- `tools/blender/`: Blender scripts that build `models/dragon.glb` and `models/creatures.glb` (see `docs/graphics-roadmap.md`). `?dragon=classic` uses the code-built dragon and creatures.
 - `js/game.js`: renderer and bloom, the frame loop, collisions, puzzles, achievements and saving.
 - `js/audio.js`: synthesized wind, score, whale song, chimes, bell and thunder (no audio files).
 - `js/main.js`: title screen, HUD, journal and map, settings, theme, install, analytics and the support callout.

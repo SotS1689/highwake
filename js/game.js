@@ -16,6 +16,7 @@ import { Creatures, loadCreatureModels } from "./creatures.js";
 import { Vessel, Input, ChaseCamera } from "./vessel.js";
 import { Audio } from "./audio.js";
 import { Cinematic } from "./cinematic.js";
+import { VolumetricClouds } from "./volclouds.js";
 import { loadDragonModel } from "./dragonModel.js";
 
 export const ACHIEVEMENTS = [
@@ -42,10 +43,10 @@ export const KEY_NAMES = { needlework: "Key of Needles", gauntlet: "Key of the S
 const SAVE_KEY = "highwake.save.v1";
 
 const QUALITY = {
-    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0 },
-    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0 },
-    high: { px: 1.5, bloom: true, veg: 9000, shadow: 2048, rays: 40 },
-    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 72 },
+    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0 },
+    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0 },
+    high: { px: 1.5, bloom: true, veg: 9000, shadow: 2048, rays: 40, clouds: 28 },
+    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 72, clouds: 48 },
 };
 
 export class Game {
@@ -127,8 +128,12 @@ export class Game {
         if (q.bloom && !this.composer) {
             // multisampled, or thin far-off lines (trunks, vines, falls) shimmer once bloom is on
             const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 });
+            // the volumetric clouds read the scene's depth
+            rt.depthTexture = new THREE.DepthTexture(innerWidth, innerHeight);
             this.composer = new EffectComposer(this.renderer, rt);
             this.composer.addPass(new RenderPass(this.scene, this.camera));
+            this.vclouds = new VolumetricClouds(this.sky, this.camera);
+            this.composer.addPass(this.vclouds);
             this.cine = new Cinematic();
             this.composer.addPass(this.cine.rays);
             this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.5, 0.55, 0.88);
@@ -137,6 +142,10 @@ export class Game {
             this.composer.addPass(this.cine.grade);
         }
         this.cine?.setQuality(q);
+        // volumetric clouds replace the flat cloud deck where the GPU can afford them
+        const vol = q.bloom && q.clouds > 0;
+        if (this.vclouds) { this.vclouds.enabled = vol; this.vclouds.setSteps(q.clouds || 28); }
+        this.sky.sea.visible = !vol;
         this.useComposer = q.bloom;
         this.resize();
     }
@@ -160,6 +169,7 @@ export class Game {
         const pxScale = (h * this.renderer.getPixelRatio()) / 1000;
         this.landmarks?.thermalPts.material.uniforms.uPx && (this.landmarks.thermalPts.material.uniforms.uPx.value = pxScale);
         this.creatures?.setPixelScale(pxScale);
+        this.falls?.setPixelScale(pxScale);
     }
 
     // ---- state ------------------------------------------------------------------------------

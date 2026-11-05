@@ -183,6 +183,42 @@ export function glowMaterial(opts = {}, glowColor = null, veins = false, detail 
 }
 
 // Leaf-clump cards from the tree atlas; normals keep pointing outward on both faces
+// Wind for instanced plants: the further a vertex is from the base (up a trunk, or down
+// a hanging vine), the more it sways; leaf cards also flutter. Gusts roll across the
+// world, so neighbouring trees move together.
+export function addWind(m, strength = 1, flutter = true) {
+    const base = m.onBeforeCompile;
+    m.onBeforeCompile = (sh, r) => {
+        base?.call(m, sh, r);
+        sh.uniforms.uTime = shared.uTime;
+        sh.vertexShader = sh.vertexShader
+            .replace("#include <common>", "#include <common>\nuniform float uTime;")
+            .replace("#include <project_vertex>", `{
+                vec3 ip = vec3(0.0);
+                #ifdef USE_INSTANCING
+                ip = instanceMatrix[3].xyz;
+                #endif
+                float k = pow(min(abs(position.y) / 50.0, 1.2), 2.0) * ${strength.toFixed(2)};
+                float gust = 0.6 + 0.4 * sin(uTime * 0.37 + ip.x * 0.0021 + ip.z * 0.0017);
+                float sway = sin(uTime * 1.25 + ip.x * 0.013 + ip.z * 0.011) * gust;
+                transformed.x += sway * k * 1.1;
+                transformed.z += cos(uTime * 1.05 + ip.z * 0.012) * gust * k * 0.6;
+                // leaves (the right half of the tree atlas) flutter on top of the sway
+                #if defined(USE_UV) && ${flutter ? 1 : 0}
+                float leaf = step(0.5, uv.x);
+                #else
+                float leaf = 0.0;
+                #endif
+                float h = fract(sin(dot(position.xz, vec2(12.9898, 78.233))) * 43758.5453);
+                transformed.y += leaf * sin(uTime * 6.0 + h * 6.28) * 0.18 * (0.3 + gust) * min(k + 0.2, 1.0);
+            }
+            #include <project_vertex>`);
+    };
+    const key = m.customProgramCacheKey?.bind(m);
+    m.customProgramCacheKey = () => (key ? key() : "") + "wind" + strength + flutter;
+    return m;
+}
+
 export function foliageMaterial(glowColor = null) {
     const m = glowMaterial({ roughness: 0.85, map: textures().tree, alphaTest: 0.5, side: THREE.DoubleSide }, glowColor);
     const base = m.onBeforeCompile;
@@ -191,7 +227,7 @@ export function foliageMaterial(glowColor = null) {
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
     };
     m.customProgramCacheKey = () => "foliage" + (glowColor || "");
-    return m;
+    return addWind(m);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
 
