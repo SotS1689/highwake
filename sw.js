@@ -1,12 +1,12 @@
 // Offline support: cache the game shell and the three.js modules it loads.
 // Bump CACHE whenever files change so installed copies update.
 
-const CACHE = "highwake-v7";
+const CACHE = "highwake-v10";
 const SHELL = [
     "./", "index.html", "css/style.css", "manifest.webmanifest",
     "js/main.js", "js/game.js", "js/world.js", "js/noise.js", "js/gfx.js", "js/sky.js", "js/islands.js",
     "js/mesher.js", "js/mesher.worker.js", "js/landmarks.js", "js/creatures.js", "js/vessel.js", "js/audio.js",
-    "js/dragon.js", "js/land.js", "js/landgen.js", "js/land.worker.js",
+    "js/dragon.js", "js/land.js", "js/landgen.js", "js/land.worker.js", "js/cinematic.js", "js/dragonModel.js", "models/dragon.glb", "models/creatures.glb",
     "tex/cliff_c.jpg", "tex/cliff_n.jpg", "tex/rock_c.jpg", "tex/grass_c.jpg", "tex/grass_n.jpg", "tex/bark_c.jpg", "tex/tree_atlas.png",
     "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png",
 ];

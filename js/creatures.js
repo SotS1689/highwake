@@ -5,6 +5,24 @@ import * as THREE from "three";
 import { worldSDF } from "./world.js";
 import { shared, glowMaterial, SHADER_END, textures } from "./gfx.js";
 import { mulberry32, makeNoise } from "./noise.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+// Sculpted creature meshes built in Blender (tools/blender/build_creatures.py). Each
+// carries the attributes the shaders below animate and shade with; without the file
+// the code-built shapes are used instead.
+export async function loadCreatureModels(url = "models/creatures.glb") {
+    const gltf = await new GLTFLoader().loadAsync(url);
+    const out = {};
+    const rename = { _GLOW: "glow", _FLEX: "aFlex", _MP: "mp", _FP: "fp" };
+    gltf.scene.traverse((o) => {
+        if (!o.isMesh) return;
+        const g = o.geometry;
+        for (const [from, to] of Object.entries(rename)) if (g.attributes[from]) { g.setAttribute(to, g.attributes[from]); g.deleteAttribute(from); }
+        g.computeBoundingSphere();
+        out[o.name] = g;
+    });
+    return out;
+}
 
 // ---------------------------------------------------------------------------------
 // Whale
@@ -462,10 +480,11 @@ class Whale {
 // ---------------------------------------------------------------------------------
 
 export class Creatures {
-    constructor(scene, entities, landmarks) {
+    constructor(scene, entities, landmarks, models = {}) {
         this.scene = scene;
+        this.models = models;
         this.whales = [];
-        const geo = whaleGeometry();
+        const geo = models.whale || whaleGeometry();
         const P = (a) => a.map((v) => new THREE.Vector3(...v));
 
         const podA = relaxPath(P([[2200, 3000, 3600], [600, 3150, 6400], [-2200, 3300, 7300], [-4600, 3300, 5600], [-4600, 3000, 2200], [-2400, 3100, -500], [-600, 3300, -2900], [2400, 3000, -1400], [3400, 3200, 1800]]), entities, 140);
@@ -491,7 +510,7 @@ export class Creatures {
 
     // ---- skylings: small flocking fliers ---------------------------------------------------
     _skylings() {
-        const g = skylingGeometry(), mat = skylingMaterial();
+        const g = this.models.skyling || skylingGeometry(), mat = skylingMaterial();
         this.flocks = [];
         const rand = mulberry32(17);
         const anchors = [[-300, 2450, 1500, 700], [-2600, 2900, -4600, 900], [5400, 3000, 2400, 600], [-4200, 2550, 1800, 650]];
@@ -554,7 +573,9 @@ export class Creatures {
         const C = new THREE.Vector3(-3800, 1500, 5000);
         const rand = mulberry32(64);
         const N = 46, T = 7;
-        const bellGeo = new THREE.SphereGeometry(1, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.55);
+        const bellGeo = this.models.jelly || new THREE.SphereGeometry(1, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.55);
+        // the Blender bell overlaps its oral arms, so it adds a little less light
+        const layered = this.models.jelly ? "0.75" : "1.0";
         const shader = (isTendril) => new THREE.ShaderMaterial({
             uniforms: { uTime: shared.uTime, uSun: shared.uGlow },
             transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
@@ -573,7 +594,7 @@ export class Creatures {
                 void main(){
                     float fr = pow(1.0 - abs(dot(normalize(vN), vV)), 2.0);
                     float a = ${isTendril ? "0.55 * (1.0 + vY)" : "0.12 + fr*0.75"};
-                    vec3 c = vC * (${isTendril ? "1.2" : "0.6 + fr*2.2"}) * (0.6 + uSun*0.8);
+                    vec3 c = vC * (${isTendril ? "1.2" : "0.6 + fr*2.2"}) * (0.6 + uSun*0.8) * ${isTendril ? "1.0" : layered};
                     gl_FragColor = vec4(c, a);
                     ${SHADER_END}
                 }`,
@@ -627,7 +648,7 @@ export class Creatures {
     // ---- great sky rays ---------------------------------------------------------------------
     _rays() {
         const N = 12;
-        this.rays = new THREE.InstancedMesh(mantaGeometry(), mantaMaterial(), N);
+        this.rays = new THREE.InstancedMesh(this.models.manta || mantaGeometry(), mantaMaterial(), N);
         this.rays.frustumCulled = false;
         this.scene.add(this.rays);
         const rand = mulberry32(81);

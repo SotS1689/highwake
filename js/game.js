@@ -12,9 +12,11 @@ import { Sky } from "./sky.js";
 import { buildIslands } from "./islands.js";
 import { Land, generateLandAsync } from "./land.js";
 import { Landmarks } from "./landmarks.js";
-import { Creatures } from "./creatures.js";
+import { Creatures, loadCreatureModels } from "./creatures.js";
 import { Vessel, Input, ChaseCamera } from "./vessel.js";
 import { Audio } from "./audio.js";
+import { Cinematic } from "./cinematic.js";
+import { loadDragonModel } from "./dragonModel.js";
 
 export const ACHIEVEMENTS = [
     { id: "first_flight", name: "Taking Wing", text: "Fly your first two kilometres.", icon: "➶" },
@@ -40,10 +42,10 @@ export const KEY_NAMES = { needlework: "Key of Needles", gauntlet: "Key of the S
 const SAVE_KEY = "highwake.save.v1";
 
 const QUALITY = {
-    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0 },
-    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024 },
-    high: { px: 1.5, bloom: true, veg: 9000, shadow: 2048 },
-    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096 },
+    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0 },
+    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0 },
+    high: { px: 1.5, bloom: true, veg: 9000, shadow: 2048, rays: 40 },
+    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 72 },
 };
 
 export class Game {
@@ -78,6 +80,10 @@ export class Game {
         this.entities = buildWorld();
         const landData = generateLandAsync();
         const texReady = texturesReady();
+        // ?dragon=classic keeps the code-built dragon and creatures; otherwise load the Blender models
+        const classic = new URLSearchParams(location.search).get("dragon") === "classic";
+        const creatureModels = classic ? Promise.resolve({}) : loadCreatureModels().catch((e) => { console.warn("creature models failed, using the classic shapes", e); return {}; });
+        const dragonModel = classic ? Promise.resolve(null) : loadDragonModel().catch((e) => { console.warn("dragon model failed, using the classic dragon", e); return null; });
         this.sky = new Sky(this.scene, this.renderer);
         onProgress(0.03, "Raising the islands…");
         const isl = await buildIslands(this.scene, this.entities, (f) => onProgress(0.05 + f * 0.8, "Raising the islands…"));
@@ -91,10 +97,10 @@ export class Game {
         this.landmarks = new Landmarks(this.scene, this.entities, this.sky);
         onProgress(0.93, "Calling the whales…");
         await new Promise((r) => setTimeout(r, 0));
-        this.creatures = new Creatures(this.scene, this.entities, this.landmarks);
+        this.creatures = new Creatures(this.scene, this.entities, this.landmarks, await creatureModels);
         for (const f of this.falls.list) if (f.mist) for (let k = 0; k < 3; k++) this.sky.addCloud([f.mist.x + (Math.random() - 0.5) * 90, f.mist.y + (Math.random() - 0.5) * 120, f.mist.z + (Math.random() - 0.5) * 90], 160 + Math.random() * 120, 0.6);
         this.sky.finishClouds();
-        this.vessel = new Vessel(this.scene);
+        this.vessel = new Vessel(this.scene, await dragonModel);
         this.chase = new ChaseCamera(this.camera);
         this.sdf = (p) => Math.min(worldSDF(this.entities, p.x, p.y, p.z, 30), this.landmarks.sdf(p), this.creatures.sdf(p));
         this.applyQuality();
@@ -123,10 +129,14 @@ export class Game {
             const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 });
             this.composer = new EffectComposer(this.renderer, rt);
             this.composer.addPass(new RenderPass(this.scene, this.camera));
+            this.cine = new Cinematic();
+            this.composer.addPass(this.cine.rays);
             this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.5, 0.55, 0.88);
             this.composer.addPass(this.bloom);
             this.composer.addPass(new OutputPass());
+            this.composer.addPass(this.cine.grade);
         }
+        this.cine?.setQuality(q);
         this.useComposer = q.bloom;
         this.resize();
     }
@@ -475,7 +485,10 @@ export class Game {
         if (flying) this._sounds(dt, world);
         if (flying) this.ui.hud(this._hudData(world));
 
-        if (this.useComposer) this.composer.render();
+        if (this.useComposer) {
+            this.cine.update(this.camera, dt, this.time, flying ? this.vessel.speed : 0);
+            this.composer.render();
+        }
         else this.renderer.render(this.scene, this.camera);
     }
 

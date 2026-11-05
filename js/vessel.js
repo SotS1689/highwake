@@ -4,6 +4,7 @@
 import * as THREE from "three";
 import { SHADER_END } from "./gfx.js";
 import { Dragon } from "./dragon.js";
+import { ModelDragon } from "./dragonModel.js";
 import { CEILING, BOUNDARY } from "./world.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -86,8 +87,9 @@ export class Input {
 
 // ---------------------------------------------------------------------------------
 export class Vessel {
-    constructor(scene) {
-        this.dragon = new Dragon();
+    // model: the Blender-built dragon (glTF), or null for the code-built one
+    constructor(scene, model = null) {
+        this.dragon = model ? new ModelDragon(model) : new Dragon();
         this.group = this.dragon.group;
         this.tipL = this.dragon.tipL;
         this.tipR = this.dragon.tipR;

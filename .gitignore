@@ -1,3 +1,7 @@
 .claude/
 __pycache__/
 node_modules/
+tools/blender/last.log
+tools/blender/*.blend1
+tools/blender/dragon.blend
+tools/blender/renders/

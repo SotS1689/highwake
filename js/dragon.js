@@ -123,7 +123,7 @@ const SKIN_GLSL = `
         return normalize(abs(det) * n - sign(det) * (dh.x * r1 + dh.y * r2));
     }`;
 
-function skinMaterial(membrane) {
+export function skinMaterial(membrane) {
     const m = new THREE.MeshPhysicalMaterial({
         vertexColors: true, metalness: 0, side: membrane ? THREE.DoubleSide : THREE.FrontSide,
         roughness: membrane ? 0.68 : 0.46,
@@ -210,7 +210,7 @@ function skinMaterial(membrane) {
     return m;
 }
 
-function eyeMaterial() {
+export function eyeMaterial() {
     const c = document.createElement("canvas");
     c.width = c.height = 128;
     const g = c.getContext("2d");
