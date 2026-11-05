@@ -54,25 +54,36 @@ class RMesh:
 
 
 def leaf(m, base, d, length, width, col, droop=0.0, cup=0.02, n=6, shape=0.8):
-    """A blade from base along d (2D direction in the render plane)."""
+    """A blade from base along d (2D direction in the render plane): five verts across
+    (edge, half, midrib, half, edge) so it can cup and arch smoothly, a lighter midrib,
+    a darker base and a sunlit tip."""
     d = Vector((d.x, d.y, 0)).normalized()
     side = Vector((-d.y, d.x, 0))
+    n = max(n, 4)
+    cols = (-1.0, -0.5, 0.0, 0.5, 1.0) if width > 0.012 else (-1.0, 0.0, 1.0)
     rows = []
     for i in range(n + 1):
         t = i / n
         w = width * math.sin(math.pi * min(1.0, t ** shape)) * (1 - 0.15 * t)
-        c = base + d * (length * t) + Vector((0, 0, cup * 3 - droop * t * t))
-        tip = [1.0 + 0.35 * t, 1.0 + 0.4 * t, 1.0 + 0.1 * t]
-        cc = tuple(col[k] * tip[k] for k in range(3))
+        arch = math.sin(math.pi * t) * cup * 2.0 - droop * t * t
+        c = base + d * (length * t) + Vector((0, 0, arch))
+        shade = (0.72 + 0.28 * min(1.0, t * 2.5)) * (1.0 + 0.3 * t)
         if i == n:
-            rows.append([m.vert(c, cc)])
+            rows.append([m.vert(c, tuple(x * shade for x in col))])
+            continue
+        row = []
+        for k in cols:
+            z = cup * (1.0 - k * k) * math.sin(math.pi * t)          # cupped across
+            rib = 1.12 if k == 0.0 else (0.8 if abs(k) == 1.0 else 0.95)
+            row.append(m.vert(c + side * (w * k) + Vector((0, 0, z)), tuple(x * shade * rib for x in col)))
+        rows.append(row)
+    for ra, rb in zip(rows, rows[1:]):
+        if len(rb) == 1:
+            for j in range(len(ra) - 1):
+                m.f.append([ra[j], ra[j + 1], rb[0]])
         else:
-            rows.append([m.vert(c - side * w + Vector((0, 0, -cup)), tuple(x * 0.82 for x in cc)), m.vert(c, cc), m.vert(c + side * w + Vector((0, 0, -cup)), tuple(x * 0.82 for x in cc))])
-    for a, b in zip(rows, rows[1:]):
-        if len(b) == 1:
-            m.f += [[a[0], a[1], b[0]], [a[1], a[2], b[0]]]
-        else:
-            m.f += [[a[0], a[1], b[1], b[0]], [a[1], a[2], b[2], b[1]]]
+            for j in range(len(ra) - 1):
+                m.f.append([ra[j], ra[j + 1], rb[j + 1], rb[j]])
 
 
 def twig(m, pts, r, col):
@@ -93,30 +104,37 @@ def jitter_col(rnd, base, amt=0.18):
 def cluster_broadleaf(m, rnd, c=0):
     o = cell_origin(c)
     stem = (0.03, 0.025, 0.015)
-    greens = [(0.07, 0.17, 0.035), (0.09, 0.2, 0.04), (0.11, 0.21, 0.035), (0.06, 0.15, 0.045)]
-    # a fan of twigs from the attach point, leaves alternating along each
-    for k in range(9):
-        a = math.radians(90 + (k - 4) * 16 + rnd.uniform(-6, 6))
-        L = 0.62 + rnd.uniform(-0.12, 0.1) - abs(k - 4) * 0.035
+    greens = [(0.07, 0.17, 0.035), (0.09, 0.2, 0.04), (0.11, 0.21, 0.035), (0.06, 0.15, 0.045), (0.12, 0.19, 0.04)]
+    # a fan of twigs from the attach point, each forking once, leaves alternating along both
+    for k in range(13):
+        a = math.radians(90 + (k - 6) * 11.5 + rnd.uniform(-5, 5))
+        L = 0.62 + rnd.uniform(-0.1, 0.08) - abs(k - 6) * 0.025
         d = Vector((math.cos(a), math.sin(a), 0))
-        pts = [o + d * (L * t) + Vector((math.sin(t * 3 + k) * 0.03, 0, 0)) for t in (0, 0.33, 0.66, 1.0)]
-        twig(m, pts, 0.006, stem)
-        nl = 9
-        for i in range(nl):
-            t = 0.22 + 0.78 * i / (nl - 1)
-            p = o + d * (L * t)
-            side = 1 if i % 2 else -1
-            la = a + side * math.radians(rnd.uniform(35, 60))
-            ld = Vector((math.cos(la), math.sin(la), 0))
-            sz = 0.12 + 0.05 * rnd.random()
-            leaf(m, p, ld, sz, sz * 0.36, jitter_col(rnd, rnd.choice(greens)))
-        leaf(m, o + d * L, d, 0.13, 0.05, jitter_col(rnd, greens[2]))
+        pts = [o + d * (L * t) + Vector((math.sin(t * 3 + k) * 0.025, 0, 0)) for t in (0, 0.33, 0.66, 1.0)]
+        twig(m, pts, 0.005, stem)
+        branches = [(o, d, L, 0.18)]
+        fa = a + rnd.choice((-1, 1)) * math.radians(rnd.uniform(25, 40))
+        fp = o + d * (L * 0.45)
+        fd = Vector((math.cos(fa), math.sin(fa), 0))
+        twig(m, [fp, fp + fd * (L * 0.45)], 0.004, stem)
+        branches.append((fp, fd, L * 0.45, 0.1))
+        for bo, bd, bl, t0 in branches:
+            ba = math.atan2(bd.y, bd.x)
+            nl = int(18 * bl / 0.62) + 3
+            for i in range(nl):
+                t = t0 + (1 - t0) * i / max(nl - 1, 1)
+                side = 1 if i % 2 else -1
+                la = ba + side * math.radians(rnd.uniform(30, 62))
+                sz = (0.075 + 0.03 * rnd.random()) * (1.0 - 0.25 * t)
+                col = jitter_col(rnd, rnd.choice(greens), 0.22)
+                leaf(m, bo + bd * (bl * t), Vector((math.cos(la), math.sin(la), 0)), sz, sz * 0.42, col, cup=0.006, n=6)
+            leaf(m, bo + bd * bl, bd, 0.085, 0.034, jitter_col(rnd, greens[2]), cup=0.006, n=6)
 
 
 def cluster_conifer(m, rnd, c=1):
     o = cell_origin(c)
     stem = (0.04, 0.03, 0.02)
-    cols = [(0.03, 0.09, 0.06), (0.04, 0.11, 0.07), (0.05, 0.12, 0.06)]
+    cols = [(0.05, 0.14, 0.08), (0.07, 0.17, 0.09), (0.09, 0.19, 0.08)]
     def spray(base, d, L, depth):
         pts = [base + d * (L * t) for t in (0, 0.5, 1.0)]
         twig(m, pts, 0.008 if depth == 0 else 0.005, stem)
@@ -129,7 +147,7 @@ def cluster_conifer(m, rnd, c=1):
                 for q in range(2):
                     nd = (d * (0.45 + 0.35 * q) + side * sgn).normalized()
                     nl = 0.085 * (1 - 0.5 * t) + 0.025
-                    leaf(m, p + Vector((0, 0, 0.004 * q)), nd, nl, 0.009, jitter_col(rnd, rnd.choice(cols), 0.25), n=2, shape=0.5)
+                    leaf(m, p + Vector((0, 0, 0.004 * q)), nd, nl, 0.011, jitter_col(rnd, rnd.choice(cols), 0.25), n=4, shape=0.5)
         if depth == 0:
             for i in range(7):
                 t = 0.12 + i * 0.12
@@ -157,7 +175,7 @@ def cluster_weeper(m, rnd, c=2):
             for sgn in (-1, 1):
                 d = (pts[i] - pts[i - 1]).normalized()
                 ld = (d + Vector((-d.y, d.x, 0)) * sgn * 0.5 + Vector((0, -0.5, 0))).normalized()
-                leaf(m, p, ld, 0.1 + 0.03 * rnd.random(), 0.018, jitter_col(rnd, rnd.choice(cols)))
+                leaf(m, p, ld, 0.1 + 0.03 * rnd.random(), 0.02, jitter_col(rnd, rnd.choice(cols)), cup=0.006, n=6)
 
 
 # --- undergrowth clusters (tex/undergrowth.png) -----------------------------------
@@ -278,6 +296,8 @@ def build_atlas(fns, name, bark=False, seed=7):
     me.from_pydata([tuple(v) for v in m.v], [], m.f)
     ca = me.color_attributes.new("Col", "FLOAT_COLOR", "POINT")
     ca.data.foreach_set("color", [x for c in m.c for x in (*c, 1.0)])
+    for poly in me.polygons:
+        poly.use_smooth = True
     ob = bpy.data.objects.new("leafatlas", me)
     bpy.context.scene.collection.objects.link(ob)
     mat = bpy.data.materials.new("leafmat")
@@ -296,7 +316,7 @@ def build_atlas(fns, name, bark=False, seed=7):
     sc.cycles.samples = 24
     sc.cycles.use_denoising = False
     sc.render.film_transparent = True
-    sc.render.resolution_x = sc.render.resolution_y = 1024
+    sc.render.resolution_x = sc.render.resolution_y = 2048
     sc.render.image_settings.file_format = "PNG"
     sc.render.image_settings.color_mode = "RGBA"
     sc.view_settings.view_transform = "Standard"
@@ -337,15 +357,15 @@ def build_atlas(fns, name, bark=False, seed=7):
         cell = px[r0:r0 + H, cx * H:(cx + 1) * H]
         # thin blades and needles are antialiased below the game's 50% alpha cut:
         # thicken the coverage so they survive (and survive mipmapping)
-        a = np.clip(cell[..., 3] * 1.7, 0, 1)
-        solid = a > 0.5
+        a = np.clip(cell[..., 3] * 1.4, 0, 1)
+        solid = a > 0.2
         mean = cell[..., :3][solid].mean(axis=0) if solid.any() else np.array([0.1, 0.2, 0.05])
         # Blender writes straight alpha; fill the empty texels with a blurred bleed
         rgb = cell[..., :3].copy()
         rgb[~solid] = 0
         acc = rgb.copy(); wsum = solid.astype(np.float32)
         cur, cw = acc, wsum
-        for _ in range(6):
+        for _ in range(10):
             pad = np.pad(cur * cw[..., None], ((1, 1), (1, 1), (0, 0)), mode="edge"); pw = np.pad(cw, 1, mode="edge")
             s = sum(pad[1 + dy:1 + dy + H, 1 + dx:1 + dx + H] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
             sw = sum(pw[1 + dy:1 + dy + H, 1 + dx:1 + dx + H] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
@@ -353,7 +373,8 @@ def build_atlas(fns, name, bark=False, seed=7):
             cw = (sw > 0).astype(np.float32)
         out_rgb = np.where(solid[..., None], rgb, cur)
         cell[..., :3] = np.clip(out_rgb, 0, 1)
-        cell[..., 3] = np.where(a > 0.5, 1.0, a)
+        # keep the soft, antialiased edge: the game turns it into a crisp edge at any scale
+        cell[..., 3] = a
         px[r0:r0 + H, cx * H:(cx + 1) * H] = cell
         log("cell", cx, cy, "coverage %.2f mean %s" % (solid.mean(), np.round(mean, 3)))
     out = bpy.data.images.new(name, W, W, alpha=True)
@@ -491,7 +512,7 @@ def canopy(seed):
         pts = grow(Vector((0, 2.5, 0)) + Vector((math.cos(a), 0, math.sin(a))) * 1.2, d, 7, 3, rnd, wobble=0.05)
         tube(bark, pts, [1.4, 1.0, 0.6, 0.25], 5, bark_col)
     crown_c = Vector((0, H * 0.78, 0)) + lean * H * 0.6
-    ao = ao_crown(crown_c, 18, 9)
+    ao = ao_crown(crown_c, 18, 9, base=0.62)
     tips = []
     nl = rnd.randint(5, 7)
     for k in range(nl):
@@ -556,7 +577,7 @@ def spire(seed):
     col = (0.92, 0.86, 0.8)
     tube(bark, trunk, tr, 8, col)
     crown_c = Vector((0, H * 0.55, 0))
-    ao = ao_crown(Vector((0, H * 0.5, 0)), 11, 26, base=0.5)
+    ao = ao_crown(Vector((0, H * 0.5, 0)), 11, 26, base=0.72)
     y = 9.0
     w = 0
     while y < H - 2:
@@ -582,6 +603,11 @@ def spire(seed):
                     card(leaves, p, seg, out, sz * 0.85, sz, 1, crown_c, ao, 0.0, bend=-0.12, nmix=0.6)
         y += 3.6 + 1.2 * t
         w += 1
+    # a tapered core of crossed sprays through the upper crown, where the limbs are short
+    for k in range(3):
+        a = k * math.pi / 3 + 0.5
+        hz = Vector((math.cos(a), 0, math.sin(a)))
+        card(leaves, Vector((0, H * 0.4, 0)), UP, hz, 17, H * 0.58, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.7)
     # tip
     for k in range(2):
         a = k * math.pi / 2
@@ -592,7 +618,11 @@ def spire(seed):
     for k in range(3):
         a = k * math.pi / 3 + 0.3
         hz = Vector((math.cos(a), 0, math.sin(a)))
-        card(lo, Vector((0, 4.0, 0)), UP, hz, 31, H - 2, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
+        # a wide lower tier and a narrower upper one, so the far fir has body, not a stalk
+        card(lo, Vector((0, 3.0, 0)), UP, hz, 36, H * 0.72, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
+        b = a + math.pi / 6
+        hb = Vector((math.cos(b), 0, math.sin(b)))
+        card(lo, Vector((0, H * 0.42, 0)), UP, hb, 20, H * 0.6, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
     tube(lo, [trunk[0], trunk[4], trunk[8]], [1.6, 0.9, 0.1], 4, col, cell=3)
     return [bark, leaves, lo]
 

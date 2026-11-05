@@ -11,6 +11,7 @@ import { buildIslands } from "./islands.js";
 import { Land, generateLandAsync } from "./land.js";
 import { Landmarks } from "./landmarks.js";
 import { Creatures, loadCreatureModels } from "./creatures.js";
+import { Motes } from "./motes.js";
 import { Vessel, Input, ChaseCamera } from "./vessel.js";
 import { Audio } from "./audio.js";
 import { Cinematic } from "./cinematic.js";
@@ -102,6 +103,7 @@ export class Game {
         onProgress(0.93, "Calling the whales…");
         await new Promise((r) => setTimeout(r, 0));
         this.creatures = new Creatures(this.scene, this.entities, this.landmarks, await creatureModels);
+        this.motes = new Motes(this.scene, this.entities);
         for (const f of this.falls.list) if (f.mist) for (let k = 0; k < 3; k++) this.sky.addCloud([f.mist.x + (Math.random() - 0.5) * 90, f.mist.y + (Math.random() - 0.5) * 120, f.mist.z + (Math.random() - 0.5) * 90], 160 + Math.random() * 120, 0.6);
         this.sky.finishClouds();
         this.vessel = new Vessel(this.scene, await dragonModel);
@@ -272,6 +274,7 @@ export class Game {
         this.landmarks?.thermalPts.material.uniforms.uPx && (this.landmarks.thermalPts.material.uniforms.uPx.value = pxScale);
         this.creatures?.setPixelScale(pxScale);
         this.falls?.setPixelScale(pxScale);
+        this.motes?.setPixelScale(pxScale);
     }
 
     // ---- state ------------------------------------------------------------------------------
@@ -589,6 +592,7 @@ export class Game {
         this.sky.update(this.state === "paused" ? 0 : dt, this.camera);
         this.vessel.dragon.aimLights(this.sky.sun, this.sky.hemi);
         updateIslandShadows(this.entities, this.camera.position, this.vessel.pos, (this._frameN = (this._frameN || 0) + 1));
+        this.motes?.update(this.camera.position, dt);
         this.land.update(this.camera);
         if (this.state !== "paused") {
             const strike = this.landmarks.update(dt, this.time, playerPos);

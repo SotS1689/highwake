@@ -2,7 +2,7 @@
 
 import * as THREE from "three";
 import { entitySDF } from "./world.js";
-import { shared, glowMaterial, foliageMaterial, addWind, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES } from "./gfx.js";
+import { shared, glowMaterial, foliageMaterial, addWind, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES, ATLAS_HANGING } from "./gfx.js";
 import { mulberry32 } from "./noise.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
@@ -200,7 +200,7 @@ function vineGeometry(L, seed, lo = false) {
         const t = Math.pow(i / nl, 1.3) * 0.95 + 0.02, c = centre(t), a = rand() * 6.28, sz = (2.6 + rand() * 1.6) * (1 - t * 0.5);
         const off = new THREE.Vector3(Math.cos(a) * 0.9, 0, Math.sin(a) * 0.9);
         leaves.push({
-            geo: new THREE.PlaneGeometry(sz * (lo ? 1.6 : 1), sz * 1.2 * (lo ? 1.6 : 1)), color: rand() < 0.5 ? "#b9e6c2" : "#a7d9b6", uvRect: LEAVES, normalFrom: [c.x, c.y + 2, c.z],
+            geo: new THREE.PlaneGeometry(sz * (lo ? 1.6 : 1), sz * 1.2 * (lo ? 1.6 : 1)), color: rand() < 0.5 ? "#e4f2e6" : "#d2e6d6", uvRect: ATLAS_HANGING, normalFrom: [c.x, c.y + 2, c.z],
             matrix: M4([c.x + off.x * 1.6, c.y - sz * 0.3, c.z + off.z * 1.6], [0, -a + Math.PI / 2, 0]).multiply(M4([0, 0, 0], [-0.35, 0, 0])),
         });
     }
@@ -213,6 +213,8 @@ class Vegetation {
         this.geos = treeGeometries();
         this.kit = kit;
         this.mat = foliageMaterial();
+        // vine leaves hang weeping fronds from the Blender leaves atlas
+        this.vineLeafMat = foliageMaterial(null, textures().leaves);
         // vine strands sway with the same wind as their leaves (foliageMaterial)
         this.glowMat = addWind(glowMaterial({ roughness: 0.8 }, "#ff9a5a"), 0.5, false);
         this.vineMat = addWind(glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff"), 1, false);
@@ -296,7 +298,7 @@ class Vegetation {
         byVariant.forEach((list, vi) => {
             if (!list.length) return;
             for (const [V, out] of [[this.geos.vines[vi], group.vinesHi], [this.geos.vinesLo[vi], group.vinesLo]]) {
-                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.mat]]) out.push(this._instanced(geo, mat, list));
+                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.vineLeafMat]]) out.push(this._instanced(geo, mat, list));
             }
         });
         this.groups.push(group);

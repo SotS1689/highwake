@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { CROWN, GATES, CHIMES, BELL, THERMALS, entitySDF, gauntletRings } from "./world.js";
-import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES } from "./gfx.js";
+import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES, ATLAS_BROADLEAF, textures } from "./gfx.js";
 import { mulberry32, makeNoise } from "./noise.js";
 
 export const NOTE_COLORS = ["#ff7a6b", "#ffc15a", "#7dff9a", "#6fd8ff", "#c79bff"];
@@ -232,7 +232,7 @@ export class Landmarks {
                 const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...d).normalize());
                 q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), rand() * 6.28));
                 leaves.push({
-                    geo: new THREE.PlaneGeometry(sz, sz), uvRect: UV_LEAVES, normalFrom: [c[0], c[1] - r * 0.3, c[2]],
+                    geo: new THREE.PlaneGeometry(sz, sz), uvRect: ATLAS_BROADLEAF, normalFrom: [c[0], c[1] - r * 0.3, c[2]],
                     matrix: new THREE.Matrix4().compose(new THREE.Vector3(...p), q, new THREE.Vector3(1, 1, 1)),
                     color: k % 3 ? "#bff2cf" : "#d4ffd8", glow: (x, y, z) => (Math.sin(x * 0.09) * Math.sin(z * 0.08) > 0.6 ? 0.5 : 0.04),
                 });
@@ -245,7 +245,7 @@ export class Landmarks {
         const tree = new THREE.Mesh(buildParts(parts), glowMaterial({ roughness: 0.85 }, "#ff8bd8", false, "bark"));
         tree.position.copy(base);
         this.scene.add(tree);
-        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#ff8bd8"));
+        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#ff8bd8", textures().leaves));
         crown.position.copy(base);
         this.scene.add(crown);
         // glowing willow tendrils (the reason to come back at night)

@@ -17,6 +17,8 @@ Direction: painterly-cinematic, 60 fps on desktops and good laptops, with lower 
 - **Rock de-tiling**: the cliff texture lookups are warped by low-frequency noise, the large layer is rotated against the small one and their mix wanders, so the repeat grid no longer shows.
 - **Ground cover**: `build_trees.py` also renders `tex/undergrowth.png` (grass tufts, ferns, flowers, low bushes). Clumps are scattered over grassy level ground, built per patch near the camera, and shrink into the ground at the edge of their range (Medium 220 m, High 320 m, Ultra 480 m, none on Low).
 - **Rock kit**: `tools/blender/build_rocks.py` makes chiselled boulders and hanging shards (`models/rocks.glb`, near and far versions). Mossy boulders sit half-sunk on island tops; dark crags hang from the undersides. They use the island material and take the island's colour where they sit.
+- **Sharper trees**: the leaf atlases are rendered at 2048 px with smaller, smooth-shaded, cupped leaves and soft antialiased edges (no more hard on/off alpha). The foliage shader keeps edges crisp at any distance (alpha-to-coverage), boosts alpha with the mip level so far leaves don't thin out, and fades cards seen edge-on so they don't smear. Vines and the great tree's crown use the new atlas; far firs have two tiers of cards, near firs a fuller upper crown.
+- **Floating motes** (`js/motes.js`): pollen by day and glowing cyan spores by night drift around the camera near islands; one GPU-animated point cloud that wraps around the camera.
 - **Island shadows**: the 16 nearest islands block the sun as soft discs (`ISLAND_SHADOW_GLSL` in `js/gfx.js`), shading the sea of clouds (flat deck and volumetric) and the dragon, which dims smoothly when it flies under an island. Hanging shards use a material with the direct sun taken away. Not applied to the land 12 km below, where the shadows blur out and cost ~2 ms.
 - **Rock**: island cliffs get irregular noise-based rock beds (an earlier ruled-line version was removed), warm and cool patches, and a ragged grass line with darker soil where grass meets rock.
 
@@ -30,6 +32,7 @@ Direction: painterly-cinematic, 60 fps on desktops and good laptops, with lower 
 1. **Compress the models** (`dragon.glb` 2.6 MB, `creatures.glb` 1.7 MB) with meshopt or Draco. Needs a tool such as gltf-transform installed from npm.
 2. **Physically based sky scattering**, replacing the colour-key sky dome.
 3. **Island shadows on vines and creatures** under the islands, using the same disc test.
+4. **Tree impostors** (pictures of each tree from many angles) for mid distance, if the far forest needs more depth; with the alpha fixes the card trees hold up well for now.
 
 ## Blender
 Blender 5.2 is installed from the Microsoft Store. Store apps can't be run directly, so `tools/blender/run.ps1` starts it through the `blender-launcher` alias and reads the script's own log (`tools/blender/last.log`).

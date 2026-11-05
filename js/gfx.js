@@ -306,11 +306,33 @@ export function foliageMaterial(glowColor = null, map = null) {
     m.onBeforeCompile = (sh, r) => {
         base(sh, r);
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
+        // Blender atlases have soft, antialiased alpha: the alpha test then gives a
+        // crisp edge at any magnification (sharpened to one pixel by three's
+        // alpha-to-coverage path). Mipmapping averages alpha down, which would thin
+        // distant leaves to nothing, so alpha is boosted with the mip level.
+        if (map) sh.fragmentShader = sh.fragmentShader.replace("#include <alphatest_fragment>", `
+            #ifdef USE_MAP
+            {
+                vec2 ts = vec2(textureSize(map, 0));
+                vec2 ddx = dFdx(vMapUv * ts), ddy = dFdy(vMapUv * ts);
+                float lod = 0.5 * log2(max(max(dot(ddx, ddx), dot(ddy, ddy)), 1e-8));
+                diffuseColor.a *= 1.0 + max(lod, 0.0) * 0.25;
+                // a card seen edge-on smears its texture into streaks: fade it out as it
+                // turns away (its real face, from screen-space derivatives)
+                vec3 fn = normalize(cross(dFdx(vViewPosition), dFdy(vViewPosition)));
+                float facing = abs(dot(fn, normalize(vViewPosition)));
+                diffuseColor.a *= smoothstep(0.06, 0.3, facing);
+            }
+            #endif
+            #include <alphatest_fragment>`);
     };
-    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas" : "");
+    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "");
     return addWind(m, 1, map ? "all" : true);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
+// cells of the Blender leaves atlas (tex/leaves.png, glTF uvs): [u0, v at the card's bottom, u1, v at its top]
+export const ATLAS_BROADLEAF = [0.004, 0.496, 0.496, 0.004];
+export const ATLAS_HANGING = [0.004, 0.504, 0.496, 0.996];   // weeping frond, hanging from its top edge
 
 // Build one non-indexed geometry from parts, each with a flat colour and glow
 export function buildParts(parts) {
