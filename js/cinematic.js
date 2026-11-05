@@ -1,10 +1,10 @@
-// Cinematic post-processing: sun shafts (god rays) in HDR before bloom, and a
-// painterly colour grade after tone mapping (split-toning by time of day,
-// gentle saturation, vignette, film grain and a touch of speed-driven
-// chromatic fringing).
+// Cinematic post-processing: sun shafts (god rays), traced at half resolution, and
+// the uniforms for the painterly colour grade (split-toning by time of day, gentle
+// saturation, vignette, film grain and speed-driven chromatic fringing). The grade
+// itself is applied in the single final pass (post.js), along with everything else.
 
 import * as THREE from "three";
-import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { Pass, FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 import { shared } from "./gfx.js";
 
 // Radial blur of the bright sky around the sun. Islands, whales and the dragon
@@ -34,8 +34,6 @@ const GodRaysShader = {
             return c * smoothstep(4.0, 12.0, l) * near;
         }
         void main() {
-            vec4 base = texture2D(tDiffuse, vUv);
-            if (uStrength <= 0.001) { gl_FragColor = base; return; }
             vec2 delta = (vUv - uSun) / float(uSamples) * 0.9;
             vec2 uv = vUv - delta * hash(vUv * 917.0); // jitter hides banding
             vec3 acc = vec3(0.0); float decay = 1.0;
@@ -46,53 +44,28 @@ const GodRaysShader = {
                 decay *= 0.965;
             }
             acc /= float(uSamples);
-            gl_FragColor = vec4(base.rgb + acc * uColor * uStrength, base.a);
+            gl_FragColor = vec4(acc * uColor * uStrength, 1.0);
         }`,
 };
 
-const GradeShader = {
-    uniforms: {
-        tDiffuse: { value: null },
-        uTime: { value: 0 },
-        uShadowTint: { value: new THREE.Color(0.42, 0.5, 0.68) },
-        uHighTint: { value: new THREE.Color(1.0, 0.86, 0.66) },
-        uSplit: { value: 0.12 },
-        uSat: { value: 1.08 },
-        uContrast: { value: 1.04 },
-        uVignette: { value: 0.32 },
-        uGrain: { value: 0.025 },
-        uFringe: { value: 0 },
-    },
-    vertexShader: GodRaysShader.vertexShader,
-    fragmentShader: /* glsl */ `
-        uniform sampler2D tDiffuse; uniform float uTime, uSplit, uSat, uContrast, uVignette, uGrain, uFringe;
-        uniform vec3 uShadowTint, uHighTint;
-        varying vec2 vUv;
-        float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
-        void main() {
-            vec2 c = vUv - 0.5;
-            float r2 = dot(c, c);
-            vec3 col;
-            if (uFringe > 0.0005) {
-                vec2 o = c * r2 * uFringe;
-                col = vec3(texture2D(tDiffuse, vUv - o).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv + o).b);
-            } else col = texture2D(tDiffuse, vUv).rgb;
-            float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
-            // split toning: cool shadows, warm highlights, like a painted sky
-            vec3 tint = mix(uShadowTint, uHighTint, smoothstep(0.1, 0.8, l));
-            col = mix(col, col * tint * 1.45, uSplit);
-            // gentle S-curve and saturation
-            col = (col - 0.5) * uContrast + 0.5;
-            l = dot(col, vec3(0.2126, 0.7152, 0.0722));
-            col = mix(vec3(l), col, uSat);
-            // vignette
-            col *= 1.0 - uVignette * smoothstep(0.08, 0.55, r2 * 1.6);
-            // film grain, stronger in the darks
-            float g = hash(vUv * 1731.0 + fract(uTime * 13.7)) - 0.5;
-            col += g * uGrain * (1.2 - l);
-            gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-        }`,
-};
+// The shafts are soft, so they're traced at half resolution into their own target;
+// the final pass adds them. Switched off whenever the sun is out of view.
+class RaysPass extends Pass {
+    constructor() {
+        super();
+        this.needsSwap = false;
+        this.uniforms = THREE.UniformsUtils.clone(GodRaysShader.uniforms);
+        this.trace = new FullScreenQuad(new THREE.ShaderMaterial({ ...GodRaysShader, uniforms: this.uniforms, depthTest: false, depthWrite: false }));
+        this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
+        this.on = true;
+    }
+    setSize(w, h) { this.target.setSize(Math.max(1, Math.round(w / 2)), Math.max(1, Math.round(h / 2))); }
+    render(renderer, writeBuffer, readBuffer) {
+        this.uniforms.tDiffuse.value = readBuffer.texture;
+        renderer.setRenderTarget(this.target);
+        this.trace.render(renderer);
+    }
+}
 
 const DAY = { sh: new THREE.Color(0.48, 0.56, 0.72), hi: new THREE.Color(1.0, 0.93, 0.8) };
 const GOLD = { sh: new THREE.Color(0.38, 0.4, 0.68), hi: new THREE.Color(1.0, 0.78, 0.52) };
@@ -100,22 +73,28 @@ const NIGHT = { sh: new THREE.Color(0.3, 0.42, 0.75), hi: new THREE.Color(0.75, 
 
 export class Cinematic {
     constructor() {
-        this.rays = new ShaderPass(GodRaysShader);
-        this.grade = new ShaderPass(GradeShader);
+        this.rays = new RaysPass();
+        // grade uniforms, read by the final pass
+        this.gradeU = {
+            uTime: { value: 0 }, uShadowTint: { value: new THREE.Color() }, uHighTint: { value: new THREE.Color() },
+            uSplit: { value: 0.12 }, uSat: { value: 1.08 }, uContrast: { value: 1.04 }, uVignette: { value: 0.32 },
+            uGrain: { value: 0.025 }, uFringe: { value: 0 },
+        };
         this._v = new THREE.Vector3();
         this._fwd = new THREE.Vector3();
         this.fringe = 0;
     }
 
     setQuality(q) {
-        this.rays.enabled = q.rays > 0;
+        this.rays.on = q.rays > 0;
+        this.rays.enabled = this.rays.on;
         this.rays.uniforms.uSamples.value = q.rays || 32;
-        this.grade.uniforms.uGrain.value = q.grain ?? 0.025;
+        this.gradeU.uGrain.value = q.grain ?? 0.025;
     }
 
     update(camera, dt, time, speed = 0) {
         const sunDir = shared.uSunDir.value;
-        const ru = this.rays.uniforms, gu = this.grade.uniforms;
+        const ru = this.rays.uniforms, gu = this.gradeU;
         // sun position on screen
         this._v.copy(camera.position).addScaledVector(sunDir, 10000).project(camera);
         camera.getWorldDirection(this._fwd);
@@ -128,6 +107,7 @@ export class Cinematic {
         // low sun = longer, richer shafts
         const low = 1 - THREE.MathUtils.smoothstep(sunDir.y, 0.15, 0.6);
         ru.uStrength.value = facing > 0 ? up * onScreen * (0.18 + 0.27 * low) : 0;
+        this.rays.enabled = this.rays.on && ru.uStrength.value > 0.002;
         ru.uColor.value.copy(shared.uSunColor.value).multiplyScalar(0.8);
 
         // grade follows the time of day: day → golden hour → night

@@ -9,9 +9,15 @@ export async function buildIslands(scene, entities, onProgress) {
     const mat = glowMaterial({ roughness: 0.95 }, null, true, true);
     const meshes = new Array(entities.length);
     const results = new Array(entities.length);
+    const coarse = new Array(entities.length);
+    // each island is meshed twice: full detail, and a coarse copy (cells LOD_SCALE times
+    // bigger, about 1/9 the triangles) drawn when it's far away and for the horizon giants
+    const LOD_SCALE = 3;
     const workers = Math.max(2, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
     // biggest first so the slow ones start early
-    const queue = entities.map((e, i) => i).sort((a, b) => (entities[b].r || 0) - (entities[a].r || 0));
+    const order = entities.map((e, i) => i).sort((a, b) => (entities[b].r || 0) - (entities[a].r || 0));
+    const queue = order.map((i) => ({ index: i, scale: 1 })).concat(order.map((i) => ({ index: i, scale: LOD_SCALE })));
+    const total = queue.length;
     let done = 0;
 
     await new Promise((resolve, reject) => {
@@ -23,16 +29,16 @@ export async function buildIslands(scene, entities, onProgress) {
                 if (--active === 0) resolve();
                 return;
             }
-            w.postMessage({ index: queue.shift() });
+            w.postMessage(queue.shift());
         };
         for (let k = 0; k < workers; k++) {
             const w = new Worker(new URL("./mesher.worker.js", import.meta.url), { type: "module" });
             active++;
             pool.push(w);
             w.onmessage = (ev) => {
-                results[ev.data.entity] = ev.data;
+                (ev.data.scale === 1 ? results : coarse)[ev.data.entity] = ev.data;
                 done++;
-                onProgress?.(done / entities.length);
+                onProgress?.(done / total);
                 next(w);
             };
             w.onerror = (err) => reject(err);
@@ -40,9 +46,7 @@ export async function buildIslands(scene, entities, onProgress) {
         }
     });
 
-    const veg = new Vegetation(scene);
-    for (let i = 0; i < entities.length; i++) {
-        const e = entities[i], r = results[i];
+    const toGeo = (r) => {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
         geo.setAttribute("normal", new THREE.BufferAttribute(r.normal, 3));
@@ -50,18 +54,30 @@ export async function buildIslands(scene, entities, onProgress) {
         geo.setAttribute("glow", new THREE.BufferAttribute(r.glow, 1));
         geo.setIndex(new THREE.BufferAttribute(r.index, 1));
         geo.computeBoundingSphere();
-        const m = new THREE.Mesh(geo, mat);
-        m.position.set(...e.pos);
-        m.matrixAutoUpdate = false;
-        m.updateMatrix();
-        scene.add(m);
+        return geo;
+    };
+    const veg = new Vegetation(scene);
+    const farGeos = new Array(entities.length);
+    for (let i = 0; i < entities.length; i++) {
+        const e = entities[i], r = results[i];
+        const m = new THREE.Mesh(toGeo(r), mat);
+        const lo = coarse[i] && coarse[i].index.length > 0 ? new THREE.Mesh(toGeo(coarse[i]), mat) : null;
+        // switch to the coarse copy once the island is small on screen
+        const lod = new THREE.LOD();
+        lod.position.set(...e.pos);
+        lod.addLevel(m, 0);
+        if (lo) lod.addLevel(lo, Math.max(2200, (e.r || 300) * 6));
+        lod.matrixAutoUpdate = false;
+        lod.updateMatrix();
+        scene.add(lod);
         meshes[i] = m;
+        farGeos[i] = lo ? lo.geometry : m.geometry;
         e.mesh = m;
         veg.add(e, r.trees, r.vines);
     }
     veg.finish();
     const falls = new Waterfalls(scene, entities);
-    return { meshes, veg, falls };
+    return { meshes, farGeos, veg, falls };
 }
 
 // ---------------------------------------------------------------------------------
@@ -105,28 +121,29 @@ function treeGeometries() {
         { geo: new THREE.ConeGeometry(1.1, 12, 6, 4), matrix: M4([3, 6, 1.5], [0.15, 0, -0.2]), color: "#d0743a", glow: (x, y) => 0.3 + y / 12 },
         { geo: new THREE.ConeGeometry(0.9, 10, 6, 4), matrix: M4([-2.5, 5, -2], [-0.2, 0, 0.18]), color: "#b54a3a", glow: (x, y) => 0.3 + y / 10 },
     ]);
-    return { umbrella: buildParts(umbrella), spire, glowPlant, vines: [vineGeometry(30, 11), vineGeometry(50, 23)] };
+    return { umbrella: buildParts(umbrella), spire, glowPlant, vines: [vineGeometry(30, 11), vineGeometry(50, 23)], vinesLo: [vineGeometry(30, 11, true), vineGeometry(50, 23, true)] };
 }
 
 // A hanging vine of length L: two bark strands twisting round a gently swaying
 // line, leaf clumps along it and glowing seed-bulbs at the nodes and the tip.
 // Returns the strand geometry (bark-mapped) and the leaf-card geometry.
-function vineGeometry(L, seed) {
+// lo: the distant version, one thin strand and a few leaf cards (about 1/20 the triangles).
+function vineGeometry(L, seed, lo = false) {
     const rand = mulberry32(seed);
     const p1 = rand() * 6.28, p2 = rand() * 6.28;
     const centre = (t) => new THREE.Vector3(Math.sin(t * 4.1 + p1) * L * 0.035 * t, -t * L, Math.sin(t * 3.3 + p2) * L * 0.03 * t);
     const strands = [];
-    for (let s = 0; s < 2; s++) {
+    for (let s = 0; s < (lo ? 1 : 2); s++) {
         const pts = [];
         for (let i = 0; i <= 48; i++) {
             const t = i / 48, a = t * L * 0.9 + s * Math.PI, r = 0.75 * (1 - t * 0.6);
             pts.push(centre(t).add(new THREE.Vector3(Math.cos(a) * r, 0, Math.sin(a) * r)));
         }
-        const tube = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 56, 0.5, 6, false);
+        const tube = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), lo ? 8 : 28, lo ? 0.8 : 0.5, lo ? 3 : 5, false);
         // taper toward the tip, and run the bark texture along the strand every few metres
         const P = tube.attributes.position, U = tube.attributes.uv;
         for (let i = 0; i < P.count; i++) {
-            const t = U.getX(i), k = 1 - t * 0.7, q = pts[Math.round(t * 48)];
+            const t = U.getX(i), k = lo ? 1 - t * 0.5 : 1 - t * 0.7, q = pts[Math.round(t * 48)];
             P.setX(i, q.x + (P.getX(i) - q.x) * k);
             P.setZ(i, q.z + (P.getZ(i) - q.z) * k);
             U.setXY(i, (t * L) / 3.0, U.getY(i));
@@ -134,21 +151,21 @@ function vineGeometry(L, seed) {
         strands.push({ geo: tube, color: s ? "#7d9a78" : "#6f8c6c", glow: 0 });
     }
     // seed-bulbs: a few along the vine, a bigger one at the tip
-    const nodes = Math.round(L / 9);
+    const nodes = lo ? 0 : Math.round(L / 9);
     for (let n = 1; n <= nodes; n++) {
         const t = n / (nodes + 1) + (rand() - 0.5) * 0.05, c = centre(t);
-        strands.push({ geo: new THREE.SphereGeometry(0.55, 8, 6), matrix: M4([c.x + 0.6, c.y, c.z], [0, 0, 0], [1, 1.3, 1]), color: "#8a7bd0", glow: 0.55 });
+        strands.push({ geo: new THREE.SphereGeometry(0.55, 6, 4), matrix: M4([c.x + 0.6, c.y, c.z], [0, 0, 0], [1, 1.3, 1]), color: "#8a7bd0", glow: 0.55 });
     }
     const tip = centre(1);
-    strands.push({ geo: new THREE.SphereGeometry(1.0, 10, 8), matrix: M4([tip.x, tip.y - 0.4, tip.z], [0, 0, 0], [1, 1.5, 1]), color: "#9a88e8", glow: 0.95 });
+    strands.push({ geo: lo ? new THREE.OctahedronGeometry(1.0) : new THREE.SphereGeometry(1.0, 8, 6), matrix: M4([tip.x, tip.y - 0.4, tip.z], [0, 0, 0], [1, 1.5, 1]), color: "#9a88e8", glow: 0.95 });
     // leaf clumps hanging off the strands, thinning out toward the tip
     const leaves = [];
-    const nl = Math.round(L * 0.8);
+    const nl = Math.round(L * (lo ? 0.25 : 0.8));
     for (let i = 0; i < nl; i++) {
         const t = Math.pow(i / nl, 1.3) * 0.95 + 0.02, c = centre(t), a = rand() * 6.28, sz = (2.6 + rand() * 1.6) * (1 - t * 0.5);
         const off = new THREE.Vector3(Math.cos(a) * 0.9, 0, Math.sin(a) * 0.9);
         leaves.push({
-            geo: new THREE.PlaneGeometry(sz, sz * 1.2), color: rand() < 0.5 ? "#b9e6c2" : "#a7d9b6", uvRect: LEAVES, normalFrom: [c.x, c.y + 2, c.z],
+            geo: new THREE.PlaneGeometry(sz * (lo ? 1.6 : 1), sz * 1.2 * (lo ? 1.6 : 1)), color: rand() < 0.5 ? "#b9e6c2" : "#a7d9b6", uvRect: LEAVES, normalFrom: [c.x, c.y + 2, c.z],
             matrix: M4([c.x + off.x * 1.6, c.y - sz * 0.3, c.z + off.z * 1.6], [0, -a + Math.PI / 2, 0]).multiply(M4([0, 0, 0], [-0.35, 0, 0])),
         });
     }
@@ -203,15 +220,17 @@ class Vegetation {
             s.setScalar(Math.max(0.35, len / this.geos.vines[vi].L));
             byVariant[vi].push(m4.compose(p, q, s).clone());
         }
+        group.vinesHi = []; group.vinesLo = [];
         byVariant.forEach((list, vi) => {
             if (!list.length) return;
-            const V = this.geos.vines[vi];
-            for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.mat]]) {
-                const im = new THREE.InstancedMesh(geo, mat, list.length);
-                list.forEach((m, k) => im.setMatrixAt(k, m));
-                im.computeBoundingSphere();
-                this.scene.add(im);
-                group.meshes.push(im);
+            for (const [V, out] of [[this.geos.vines[vi], group.vinesHi], [this.geos.vinesLo[vi], group.vinesLo]]) {
+                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.mat]]) {
+                    const im = new THREE.InstancedMesh(geo, mat, list.length);
+                    list.forEach((m, k) => im.setMatrixAt(k, m));
+                    im.computeBoundingSphere();
+                    this.scene.add(im);
+                    out.push(im);
+                }
             }
         });
         this.groups.push(group);
@@ -219,12 +238,16 @@ class Vegetation {
 
     finish() {}
 
-    // Hide forests on far islands; they're sub-pixel there anyway
+    // Hide forests on far islands (they're sub-pixel there anyway); vines get a detailed
+    // version up close, a light one at middle distance, and none beyond that.
     update(cam, range) {
+        const VINE_HI = 900, VINE_LO = Math.min(range, 4500);
         for (const g of this.groups) {
             const d = Math.hypot(g.e.pos[0] - cam.x, g.e.pos[1] - cam.y, g.e.pos[2] - cam.z) - (g.e.r || 500);
             const vis = d < range;
             for (const m of g.meshes) m.visible = vis;
+            for (const m of g.vinesHi) m.visible = d < VINE_HI;
+            for (const m of g.vinesLo) m.visible = d >= VINE_HI && d < VINE_LO;
         }
     }
 }

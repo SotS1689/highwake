@@ -4,8 +4,6 @@
 import * as THREE from "three";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
-import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
-import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { buildWorld, worldSDF, GATES, WONDERS, THERMALS, BELL, CHIME_ORDER, CROWN, SPAWN } from "./world.js";
 import { shared, texturesReady } from "./gfx.js";
 import { Sky } from "./sky.js";
@@ -17,6 +15,7 @@ import { Vessel, Input, ChaseCamera } from "./vessel.js";
 import { Audio } from "./audio.js";
 import { Cinematic } from "./cinematic.js";
 import { VolumetricClouds } from "./volclouds.js";
+import { BloomPass, FinalPass } from "./post.js";
 import { loadDragonModel } from "./dragonModel.js";
 
 export const ACHIEVEMENTS = [
@@ -42,11 +41,12 @@ export const ACHIEVEMENTS = [
 export const KEY_NAMES = { needlework: "Key of Needles", gauntlet: "Key of the Spine", resonance: "Key of Song", kinship: "Key of Kinship" };
 const SAVE_KEY = "highwake.save.v1";
 
+// msaa: anti-aliasing samples for the scene; cloudScale: size of the cloud raymarch
 const QUALITY = {
-    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0 },
-    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0 },
-    high: { px: 1.5, bloom: true, veg: 9000, shadow: 2048, rays: 40, clouds: 28 },
-    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 72, clouds: 48 },
+    low: { px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0, msaa: 0 },
+    medium: { px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0, msaa: 2 },
+    high: { px: 1.25, bloom: true, veg: 9000, shadow: 2048, rays: 32, clouds: 24, cloudScale: 0.4, msaa: 2 },
+    ultra: { px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 64, clouds: 40, cloudScale: 0.5, msaa: 4 },
 };
 
 export class Game {
@@ -89,7 +89,8 @@ export class Game {
         onProgress(0.03, "Raising the islands…");
         const isl = await buildIslands(this.scene, this.entities, (f) => onProgress(0.05 + f * 0.8, "Raising the islands…"));
         this.veg = isl.veg;
-        this.sky.setFarGeometries(this.entities.map((e, i) => ({ geo: isl.meshes[i].geometry, r: e.r, big: e.kind === "island" && !e.small })).filter((g) => g.big));
+        // the horizon giants are 40-60 km away: the coarse island copies are plenty
+        this.sky.setFarGeometries(this.entities.map((e, i) => ({ geo: isl.farGeos[i], r: e.r, big: e.kind === "island" && !e.small })).filter((g) => g.big));
         this.falls = isl.falls;
         onProgress(0.86, "Unrolling the world below…");
         this.land = new Land(this.scene, await landData, this.sky);
@@ -109,8 +110,13 @@ export class Game {
         this._initPuzzles();
         this.resize();
         await texReady;
-        // compile shaders before the first real frame
-        this.renderer.compile(this.scene, this.camera);
+        onProgress(0.93, "Warming up the sky…");
+        await this._warmUp();
+        this._checkGpu();
+        if (this.settings.autoQuality && !this.software) {
+            onProgress(0.96, "Tuning graphics for this computer…");
+            await this._calibrate();
+        }
         onProgress(1, "Ready");
         this.state = "title";
         this.vessel.reset(SPAWN.pos, SPAWN.dir);
@@ -118,17 +124,105 @@ export class Game {
         this.renderer.setAnimationLoop(() => this.frame());
     }
 
+    // Spot a browser drawing without the graphics card (hardware acceleration off, or a
+    // blocked driver): the game can't be smooth that way, and only the browser can fix it.
+    _checkGpu() {
+        const gl = this.renderer.getContext();
+        const ext = gl.getExtension("WEBGL_debug_renderer_info");
+        const name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+        this.gpuName = name;
+        console.info("Highwake GPU:", name);
+        if (/swiftshader|llvmpipe|softpipe|basic render|software|microsoft basic/i.test(name)) {
+            this.software = true;
+            if (!this.settings.autoQuality) return;
+            this.settings.quality = "low";
+            this.applyQuality();
+            setTimeout(() => this.ui.hint("Your browser is drawing without your graphics card, so Highwake will be slow. Turn on hardware acceleration in the browser's settings, then restart it."), 1500);
+        }
+    }
+
+    // Measure how long this computer takes to draw a busy view at each quality, and pick
+    // the best quality (and resolution) that leaves room for a steady 60 frames a second.
+    // Runs during loading, so it costs a few seconds there instead of lag in flight.
+    async _calibrate() {
+        const gl = this.renderer.getContext(), px = new Uint8Array(4);
+        const sync = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const pos = this.camera.position.clone(), q0 = this.camera.quaternion.clone();
+        // a heavy view: high over the archipelago, looking across it toward the sun
+        this.camera.position.set(-6000, 5200, 6000);
+        this.camera.lookAt(-6000 + 750, 5200 - 180, 6000 - 600);
+        this.camera.updateMatrixWorld();
+        this.sky.update(0, this.camera);
+        this.land.update(this.camera);
+        this.veg.update(this.camera.position, this.vegRange);
+        const draw = () => { this.cine?.update(this.camera, 0, this.time, 0); if (this.useComposer) this.composer.render(); else this.renderer.render(this.scene, this.camera); };
+        const measure = () => {
+            draw(); draw(); sync();
+            const t = performance.now();
+            for (let i = 0; i < 5; i++) draw();
+            sync();
+            return (performance.now() - t) / 5;
+        };
+        const BUDGET = 11;      // ms of drawing, leaving the rest of the 16.7 ms frame for everything else
+        // prefer keeping the effects and drawing fewer pixels; drop effects only after that
+        const tries = [["high", 1], ["high", 0.8], ["high", 0.67], ["medium", 0.8], ["medium", 0.67], ["medium", 0.55], ["low", 1], ["low", 0.75]];
+        let pick = null, lastMs = 0;
+        for (const [qName, scale] of tries) {
+            this.settings.quality = qName;
+            this.renderScale = scale;
+            this.applyQuality();
+            this.veg.update(this.camera.position, this.vegRange);
+            lastMs = measure();
+            if (lastMs <= BUDGET) { pick = [qName, scale]; break; }
+            await new Promise((r) => setTimeout(r, 0));
+        }
+        if (!pick) pick = ["low", Math.max(0.5, Math.min(0.75, 0.75 * Math.sqrt(BUDGET / lastMs)))];
+        this.settings.quality = pick[0];
+        this.renderScale = pick[1];
+        this.applyQuality();
+        this.ui.saveSettings();
+        this.calibration = { quality: pick[0], scale: pick[1], ms: Math.round(lastMs * 10) / 10 };
+        console.info("Highwake graphics:", this.calibration, this.gpuName);
+        this.camera.position.copy(pos); this.camera.quaternion.copy(q0);
+    }
+
+    // Compile every shader and upload every texture before play, so nothing stalls the
+    // first time it comes into view (far flocks, jellies and forests start hidden).
+    // Loading takes a little longer; flight doesn't hitch.
+    async _warmUp() {
+        const hidden = [];
+        this.scene.traverse((o) => { if (!o.visible) { hidden.push(o); o.visible = true; } });
+        if (this.renderer.compileAsync) await this.renderer.compileAsync(this.scene, this.camera);
+        else this.renderer.compile(this.scene, this.camera);
+        // render a frame looking each way through the whole post chain, so the passes,
+        // shadow maps and every texture are ready too
+        const pos = this.camera.position.clone(), q = this.camera.quaternion.clone();
+        this.camera.position.set(...SPAWN.pos);
+        const dirs = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0.3, -0.9, 0.3], [0.3, 0.9, 0.3]];
+        for (const d of dirs) {
+            this.camera.lookAt(this.camera.position.clone().add(new THREE.Vector3(...d)));
+            this.camera.updateMatrixWorld();
+            if (this.useComposer) this.composer.render(); else this.renderer.render(this.scene, this.camera);
+            await new Promise((r) => setTimeout(r, 0));
+        }
+        this.camera.position.copy(pos); this.camera.quaternion.copy(q);
+        for (const o of hidden) o.visible = false;
+    }
+
     applyQuality() {
         const q = QUALITY[this.settings.quality] || QUALITY.high;
-        const px = Math.min(window.devicePixelRatio || 1, q.px);
+        // dynamic resolution scales the pixel ratio down (never the effects) to hold the frame rate
+        this.renderScale ??= 1;
+        this.basePx = Math.min(window.devicePixelRatio || 1, q.px);
+        const px = Math.max(0.5, this.basePx * this.renderScale);
         this.renderer.setPixelRatio(px);
         this.px = px;
         this.vegRange = q.veg;
         this.vessel?.dragon.setShadows(this.sky.sun, q.shadow);
         if (q.bloom && !this.composer) {
-            // multisampled, or thin far-off lines (trunks, vines, falls) shimmer once bloom is on
-            const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 });
-            // the volumetric clouds read the scene's depth
+            // the scene is drawn once into an HDR target (with depth, for the clouds and haze);
+            // everything else works from that, with a single full-size pass at the end
+            const rt = new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: q.msaa });
             rt.depthTexture = new THREE.DepthTexture(innerWidth, innerHeight);
             this.composer = new EffectComposer(this.renderer, rt);
             this.composer.addPass(new RenderPass(this.scene, this.camera));
@@ -136,15 +230,21 @@ export class Game {
             this.composer.addPass(this.vclouds);
             this.cine = new Cinematic();
             this.composer.addPass(this.cine.rays);
-            this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.5, 0.55, 0.88);
+            this.bloom = new BloomPass();
             this.composer.addPass(this.bloom);
-            this.composer.addPass(new OutputPass());
-            this.composer.addPass(this.cine.grade);
+            this.final = new FinalPass({ camera: this.camera, clouds: this.vclouds, rays: this.cine.rays, bloom: this.bloom, grade: this.cine.gradeU });
+            this.composer.addPass(this.final);
+        }
+        if (this.composer) {
+            for (const t of [this.composer.renderTarget1, this.composer.renderTarget2]) {
+                if (t.samples !== q.msaa) { t.samples = q.msaa; t.dispose(); }
+            }
+            this.vclouds.scale = q.cloudScale || 0.5;
         }
         this.cine?.setQuality(q);
         // volumetric clouds replace the flat cloud deck where the GPU can afford them
         const vol = q.bloom && q.clouds > 0;
-        if (this.vclouds) { this.vclouds.enabled = vol; this.vclouds.setSteps(q.clouds || 28); }
+        if (this.vclouds) { this.vclouds.enabled = vol; this.vclouds.setSteps(q.clouds || 24); }
         this.sky.sea.visible = !vol;
         this.useComposer = q.bloom;
         this.resize();
@@ -164,7 +264,6 @@ export class Game {
         if (this.composer) {
             this.composer.setPixelRatio(this.renderer.getPixelRatio());
             this.composer.setSize(w, h);
-            this.bloom?.resolution.set(w / 2, h / 2);
         }
         const pxScale = (h * this.renderer.getPixelRatio()) / 1000;
         this.landmarks?.thermalPts.material.uniforms.uPx && (this.landmarks.thermalPts.material.uniforms.uPx.value = pxScale);
@@ -438,6 +537,7 @@ export class Game {
     // ---- frame ----------------------------------------------------------------------------------
     frame(fixedDt) {
         const dt = fixedDt ?? Math.min(0.05, this.clock.getDelta());
+        if (fixedDt === undefined) this._dynamicRes();
         this.time += dt;
         shared.uTime.value = this.time;
         const flying = this.state === "flying";
@@ -555,24 +655,70 @@ export class Game {
         this.landmarks.monoBoost = Math.max(0, 1 - dMono / 900) * 1.5;
     }
 
+    // Dynamic resolution: watch the real time between frames and lower the render
+    // resolution in steps when frames run long, raising it again only after a long
+    // smooth stretch (and never straight back to a level that just lagged).
+    _dynamicRes() {
+        const now = performance.now();
+        const D = (this.dyn ??= { last: now, acc: 0, n: 0, slowRuns: 0, goodRuns: 0, ceiling: 1, ceilingT: 0, worst: 0 });
+        const ms = now - D.last;
+        D.last = now;
+        if (this.state !== "flying" || ms > 250) { D.acc = D.n = 0; return; }   // paused, tab hidden or a load hitch
+        D.acc += ms; D.n++;
+        D.worst = Math.max(D.worst, ms);
+        if (D.acc < 1000) return;
+        const avg = D.acc / D.n;
+        D.acc = D.n = 0;
+        const worst = D.worst;
+        D.worst = 0;
+        let next = this.renderScale;
+        if (avg > 17.8 || worst > 45) {
+            D.goodRuns = 0;
+            if (++D.slowRuns >= 1) {
+                next = Math.max(0.5, this.renderScale * (avg > 24 ? 0.8 : 0.9));
+                D.ceiling = this.renderScale;          // don't climb back to this for a while
+                D.ceilingT = now + 30000;
+                D.slowRuns = 0;
+            }
+        } else {
+            D.slowRuns = 0;
+            // on a 60 Hz screen frames sit at ~16.7 ms however much headroom is left, so
+            // only probe upward after a long smooth run
+            if (++D.goodRuns >= (avg < 12 ? 2 : 6)) {
+                D.goodRuns = 0;
+                const cap = now < D.ceilingT ? D.ceiling * 0.97 : 1;
+                next = Math.min(cap, this.renderScale * 1.06, 1);
+            }
+        }
+        if (Math.abs(next - this.renderScale) > 0.01) {
+            this.renderScale = next;
+            const px = Math.max(0.5, this.basePx * next);
+            this.renderer.setPixelRatio(px);
+            this.px = px;
+            this.resize();
+        }
+    }
+
+    // If resolution scaling has already gone as low as it sensibly can and frames still
+    // run slow, step the effects down one quality level (and say so).
     _autoQuality(dt) {
         const A = this.counters.autoQ;
         if (A.done || !this.settings.autoQuality) return;
         A.t += dt; A.frames++;
         if (A.t < 2) { A.frames = 0; return; }
-        if (A.t > 8) {
-            const fps = A.frames / (A.t - 2);
-            A.done = true;
-            const order = ["low", "medium", "high", "ultra"];
-            const i = order.indexOf(this.settings.quality);
-            if (fps < 42 && i > 0) {
-                this.settings.quality = order[i - 1];
-                this.ui.saveSettings();
-                this.applyQuality();
-                this.ui.hint(`Graphics set to ${order[i - 1]} for smoother flight. Change it in Settings.`);
-                A.done = false; A.t = 0; A.frames = 0;
-            }
-        }
+        if (A.t < 10) return;
+        const fps = A.frames / (A.t - 2);
+        A.t = 0; A.frames = 0;
+        if (fps >= 50) { A.done = true; return; }
+        if ((this.renderScale ?? 1) > 0.6) return;          // let resolution scaling act first
+        const order = ["low", "medium", "high", "ultra"];
+        const i = order.indexOf(this.settings.quality);
+        if (i <= 0) { A.done = true; return; }
+        this.settings.quality = order[i - 1];
+        this.ui.saveSettings();
+        this.renderScale = 0.85;
+        this.applyQuality();
+        this.ui.hint(`Graphics set to ${order[i - 1]} for smoother flight. Change it in Settings.`);
     }
 
     _hudData(world) {

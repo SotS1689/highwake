@@ -5,6 +5,8 @@
 // It reads the scene's depth so islands, whales and the dragon sit inside the clouds
 // correctly, then adds low-lying haze in the same march: aerial perspective that
 // thickens toward the deck and warms toward the sun.
+// Performance: the march runs at reduced resolution into its own target; the single
+// final pass (post.js) lays it over the scene and adds the haze, which is analytic.
 
 import * as THREE from "three";
 import { Pass, FullScreenQuad } from "three/addons/postprocessing/Pass.js";
@@ -22,11 +24,12 @@ const shader = {
         uSunDir: shared.uSunDir, uSunColor: shared.uSunColor,
         uLit: { value: new THREE.Color() }, uShade: { value: new THREE.Color() }, uFarCol: { value: new THREE.Color() },
         uHaze: shared.uHaze, uSteps: { value: 32 }, uFrame: { value: 0 },
+        tCloud: { value: null }, uTexel: { value: new THREE.Vector2() },
     },
     vertexShader: /* glsl */ `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
     fragmentShader: /* glsl */ `
         #include <packing>
-        uniform sampler2D tDiffuse, tDepth, uNoise;
+        uniform sampler2D tDiffuse, tDepth, uNoise, tCloud; uniform vec2 uTexel;
         uniform mat4 uInvProj, uCamWorld; uniform vec3 uCam, uSunDir, uSunColor, uLit, uShade, uFarCol, uHaze;
         uniform float uNear, uFar, uTime, uCover, uFrame; uniform int uSteps;
         varying vec2 vUv;
@@ -49,14 +52,21 @@ const shader = {
         }
 
         void main(){
-            vec4 base = texture2D(tDiffuse, vUv);
             // world-space ray through this pixel
             vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
             vec3 vdir = normalize(vp.xyz / vp.w);
             vec3 D = normalize(mat3(uCamWorld) * vdir);
+            #ifdef MARCH
+            // this half-res pixel covers 2x2 scene pixels: stop at the nearest of them, so
+            // cloud never smears over the edge of something in front of it
+            float depth = min(min(texture2D(tDepth, vUv + uTexel * vec2(-0.5, -0.5)).x, texture2D(tDepth, vUv + uTexel * vec2(0.5, -0.5)).x),
+                              min(texture2D(tDepth, vUv + uTexel * vec2(-0.5, 0.5)).x, texture2D(tDepth, vUv + uTexel * vec2(0.5, 0.5)).x));
+            #else
             float depth = texture2D(tDepth, vUv).x;
+            #endif
             float tScene = depth >= 0.99999 ? 1e9 : perspectiveDepthToViewZ(depth, uNear, uFar) / vdir.z;
 
+            #ifdef MARCH
             vec3 col = vec3(0.0); float T = 1.0;
             // slab entry and exit
             float t0, t1;
@@ -100,6 +110,11 @@ const shader = {
                     }
                 }
             }
+            gl_FragColor = vec4(col, T);
+            #else
+            vec4 base = texture2D(tDiffuse, vUv);
+            vec4 cl = texture2D(tCloud, vUv);
+            vec3 col = cl.rgb; float T = cl.a;
             // low-lying haze: thickest at the deck, thinning with height, warm toward the sun
             float tEnd = min(tScene, 60000.0);
             float k = 0.00045;                 // 1 / haze scale height
@@ -110,6 +125,7 @@ const shader = {
             vec3 outc = base.rgb * T + col;
             outc = mix(outc, hz, haze * (tScene < 1e8 ? 1.0 : 0.0));
             gl_FragColor = vec4(outc, base.a);
+            #endif
         }`,
 };
 
@@ -118,18 +134,28 @@ export class VolumetricClouds extends Pass {
         super();
         this.sky = sky;
         this.camera = camera;
-        this.material = new THREE.ShaderMaterial({ ...shader, uniforms: THREE.UniformsUtils.clone(shader.uniforms), depthTest: false, depthWrite: false });
-        const u = this.material.uniforms;
+        const make = (march) => new THREE.ShaderMaterial({
+            ...shader, defines: march ? { MARCH: "" } : {},
+            uniforms: this.u, depthTest: false, depthWrite: false,
+        });
+        const u = (this.u = THREE.UniformsUtils.clone(shader.uniforms));
         // keep the shared (live) uniforms shared
         for (const k of ["uTime", "uSunDir", "uSunColor", "uHaze"]) u[k] = shader.uniforms[k];
         u.uNoise.value = sky.noiseTex;
         u.uCover = sky.seaU.uCover;
-        this.u = u;
-        this.quad = new FullScreenQuad(this.material);
+        this.needsSwap = false;
+        this.marchQuad = new FullScreenQuad(make(true));
+        this.target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
+        this.scale = 0.5;
         this.frame = 0;
     }
 
     setSteps(n) { this.u.uSteps.value = n; }
+
+    setSize(w, h) {
+        this.target.setSize(Math.max(1, Math.round(w * this.scale)), Math.max(1, Math.round(h * this.scale)));
+        this.u.uTexel.value.set(1 / w, 1 / h);
+    }
 
     render(renderer, writeBuffer, readBuffer) {
         const u = this.u, cam = this.camera;
@@ -143,9 +169,11 @@ export class VolumetricClouds extends Pass {
         u.uShade.value.copy(this.sky.seaU.uShade.value);
         u.uFarCol.value.copy(this.sky.seaU.uFar.value);
         u.uFrame.value = this.frame = (this.frame + 1) % 64;
-        renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
-        this.quad.render(renderer);
+        renderer.setRenderTarget(this.target);
+        this.marchQuad.render(renderer);
     }
 
-    dispose() { this.material.dispose(); this.quad.dispose(); }
+    get texture() { return this.target.texture; }
+
+    dispose() { this.marchQuad.material.dispose(); this.marchQuad.dispose(); this.target.dispose(); }
 }
