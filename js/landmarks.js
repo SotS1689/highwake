@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { CROWN, GATES, CHIMES, BELL, THERMALS, entitySDF, gauntletRings } from "./world.js";
-import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES, ATLAS_BROADLEAF, textures } from "./gfx.js";
+import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES, ATLAS_BROADLEAF, ATLAS_HANGING, textures } from "./gfx.js";
 import { mulberry32, makeNoise } from "./noise.js";
 
 export const NOTE_COLORS = ["#ff7a6b", "#ffc15a", "#7dff9a", "#6fd8ff", "#c79bff"];
@@ -13,6 +13,46 @@ export const NOTE_COLORS = ["#ff7a6b", "#ffc15a", "#7dff9a", "#6fd8ff", "#c79bff
 function surfaceY(e, x, z) {
     for (let y = e.h * 1.2; y > -e.h * 2; y -= 2) if (entitySDF(e, x, y, z) < 0) return e.pos[1] + y;
     return e.pos[1];
+}
+
+// An indexed tube along a polyline with a radius per point (parallel-transport frames,
+// so it never twists or pinches). uv: u around, v = metres along / vScale.
+// radius may be a function (i, j, angle) => r for knotted, ridged bark.
+function tubeGeo(pts, radii, sides, vScale = 40) {
+    const n = pts.length, pos = [], uv = [], idx = [];
+    const T = pts.map((_, i) => pts[Math.min(n - 1, i + 1)].clone().sub(pts[Math.max(0, i - 1)]).normalize());
+    let N = Math.abs(T[0].y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    N = N.sub(T[0].clone().multiplyScalar(N.dot(T[0]))).normalize();
+    let acc = 0;
+    for (let i = 0; i < n; i++) {
+        if (i) {
+            acc += pts[i].distanceTo(pts[i - 1]);
+            N.sub(T[i].clone().multiplyScalar(N.dot(T[i]))).normalize();
+        }
+        const B = T[i].clone().cross(N);
+        for (let j = 0; j <= sides; j++) {
+            const a = (j / sides) * Math.PI * 2;
+            const r = typeof radii === "function" ? radii(i, j, a) : radii[i];
+            const d = N.clone().multiplyScalar(Math.cos(a)).addScaledVector(B, Math.sin(a));
+            pos.push(pts[i].x + d.x * r, pts[i].y + d.y * r, pts[i].z + d.z * r);
+            uv.push(j / sides, acc / vScale);
+        }
+        if (i) for (let j = 0; j < sides; j++) {
+            const a = (i - 1) * (sides + 1) + j, b = a + sides + 1;
+            idx.push(a, a + 1, b, a + 1, b + 1, b);   // outward-facing
+        }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    g.setIndex(idx);
+    return g;
+}
+
+// a smooth path through control points (centripetal Catmull-Rom), n samples
+function smoothPath(ctrl, n) {
+    const c = new THREE.CatmullRomCurve3(ctrl.map((p) => (p.isVector3 ? p : new THREE.Vector3(...p))), false, "centripetal");
+    return c.getPoints(n - 1);
 }
 
 export class Landmarks {
@@ -169,97 +209,260 @@ export class Landmarks {
     }
 
     // ---- the Worldtree ----------------------------------------------------------------
+    // A braided giant: six stems twist round each other into one column, then part into
+    // sweeping limbs that carry tiers of pale, cloud-like foliage far past the island's
+    // rim. Its roots crawl over the edge and hang hundreds of metres into the open sky.
+    // By night the crown, the root tips and the veins in the bark glow cyan and violet,
+    // and lantern-fruit hang under every tier.
     _worldtree() {
         const e = this.byId.verdance;
-        const base = new THREE.Vector3(e.pos[0], surfaceY(e, 0, 0) - 30, e.pos[2]);
-        const H = 980;
+        const top = surfaceY(e, 0, 0);
+        const base = new THREE.Vector3(e.pos[0], top - 25, e.pos[2]);
         const rand = mulberry32(77);
-        const n = makeNoise(77);
-        const trunk = new THREE.CylinderGeometry(34, 95, H, 28, 40).translate(0, H / 2, 0);
-        {
-            const P = trunk.attributes.position;
-            for (let i = 0; i < P.count; i++) {
-                const x = P.getX(i), y = P.getY(i), z = P.getZ(i);
-                const th = Math.atan2(z, x);
-                const k = 1 + 0.16 * Math.sin(th * 7 + y * 0.012) + n.noise3(x * 0.03, y * 0.01, z * 0.03) * 0.1;
-                const flare = 1 + Math.pow(Math.max(0, 1 - y / 160), 2) * 0.8;
-                P.setXYZ(i, x * k * flare, y, z * k * flare);
+        const noise = makeNoise(77);
+        const V3 = (x, y, z) => new THREE.Vector3(x, y, z);
+        const H = 1150;                // where the braid parts into limbs
+        const S = 6;                  // stems in the braid
+        const TWIST = Math.PI * 2 * 0.85;
+        const bark = [], leaves = [], pads = [], fruit = [];
+        const toWorld = (p) => [base.x + p.x, base.y + p.y, base.z + p.z];
+        const capsule = (a, b, r) => this.colliders.push({ t: "c", a: toWorld(a), b: toWorld(b), r });
+
+        // bark: pale ash above, darkening into the roots; cyan veins spiral up the braid
+        const barkShade = (x, y) => 0.5 + 0.5 * THREE.MathUtils.smoothstep(y, -200, 900);
+        const veinGlow = (x, y, z) => {
+            const s = Math.sin(Math.atan2(z, x) * 9 + y * 0.011 + noise.noise3(x * 0.01, y * 0.004, z * 0.01) * 2.5);
+            return s > 0.965 ? 0.85 : y < -60 ? Math.max(0, (-y - 300) / 900) * 0.9 : 0;   // root tips glow too
+        };
+        const ridged = (pts, r0, r1, swell = 0) => (i, j, a) => {
+            const t = i / (pts.length - 1);
+            const r = THREE.MathUtils.lerp(r0, r1, Math.pow(t, 0.8)) + swell * Math.pow(1 - t, 5);
+            const p = pts[i];
+            return r * (1 + 0.1 * Math.sin(a * 5 + t * 9) + 0.08 * noise.noise3(p.x * 0.02 + a, p.y * 0.02, p.z * 0.02));
+        };
+        const addTube = (pts, radius, sides, color) => bark.push({ geo: tubeGeo(pts, radius, sides, 60), color, shade: barkShade, glow: veinGlow });
+
+        // ---- the braid ----
+        const stemTops = [];
+        for (let s = 0; s < S; s++) {
+            const ph = (s / S) * Math.PI * 2;
+            const pts = [];
+            for (let k = 0; k <= 56; k++) {
+                const t = k / 56;
+                const rax = 66 + 200 * Math.pow(1 - t, 3) + 150 * THREE.MathUtils.smoothstep(t, 0.72, 1.0);
+                const a = ph + t * TWIST;
+                pts.push(V3(Math.cos(a) * rax, t * H, Math.sin(a) * rax));
+            }
+            stemTops.push({ pts, p: pts[pts.length - 1], a: ph + TWIST, ph });
+        }
+        capsule(V3(0, 0, 0), V3(0, H, 0), 185);
+
+        // a leader rising from the heart of the braid to the topmost tier
+        const leader = smoothPath([[0, H * 0.6, 0], [25, H + 150, -12], [-35, H + 420, 30], [0, H + 600, 0]], 20);
+        addTube(leader, ridged(leader, 72, 22), 14, "#d6cebf");
+        capsule(leader[0], leader[leader.length - 1], 50);
+
+        // ---- limbs, forks and the tiers of foliage they carry ----
+        const padAt = (c, R, tier) => pads.push({ c, R, tier });
+        const skel = [];    // limb points the crown's branches can grow from
+        for (const q of leader) if (q.y > H + 200) skel.push(q);
+        for (const st of stemTops) {
+            const out = V3(Math.cos(st.a), 0, Math.sin(st.a));
+            const side = V3(-out.z, 0, out.x);
+            const reach = 820 + rand() * 320, lift = 180 + rand() * 200;
+            const p0 = st.p;
+            // the stem and its limb are one piece of wood: a single smooth path from the
+            // root flare, up through the braid, bending out along the limb to its tip
+            const ctrl = st.pts.filter((_, k) => k % 4 === 0 && k <= 48);
+            ctrl.push(p0, p0.clone().addScaledVector(out, reach * 0.3).add(V3(0, lift * 0.9, 0)),
+                p0.clone().addScaledVector(out, reach * 0.65).add(V3(0, lift * 1.15, 0)).addScaledVector(side, (rand() - 0.5) * 120),
+                p0.clone().addScaledVector(out, reach).add(V3(0, lift * 0.85, 0)).addScaledVector(side, (rand() - 0.5) * 160));
+            const full = smoothPath(ctrl, 110);
+            const acc = [0];
+            for (let i = 1; i < full.length; i++) acc.push(acc[i - 1] + full[i].distanceTo(full[i - 1]));
+            const total = acc[acc.length - 1];
+            let iStart = full.findIndex((q) => q.y >= p0.y - 1);
+            if (iStart < 0) iStart = Math.round(full.length * 0.55);
+            const s0 = acc[iStart] / total;
+            addTube(full, (i, j, a) => {
+                const sN = acc[i] / total, q = full[i];
+                const r = sN < s0
+                    ? THREE.MathUtils.lerp(95, 58, Math.pow(sN / s0, 0.8)) + 50 * Math.pow(1 - sN / s0, 5)
+                    : THREE.MathUtils.lerp(58, 2.5, Math.pow((sN - s0) / (1 - s0), 0.85));
+                return r * (1 + 0.1 * Math.sin(a * 5 + sN * 20) + 0.08 * noise.noise3(q.x * 0.02 + a, q.y * 0.02, q.z * 0.02));
+            }, 18, "#b8ab97");
+            const lp = full.slice(iStart);
+            const limb = Array.from({ length: 26 }, (_, k) => lp[Math.round((k * (lp.length - 1)) / 25)]);
+            capsule(limb[0], limb[13], 48);
+            capsule(limb[13], limb[25], 22);
+            skel.push(...limb.slice(7));
+            padAt(limb[25].clone().add(V3(0, 50, 0)), 290 + rand() * 70, 0);
+            padAt(limb[15].clone().add(V3(0, 110, 0)), 270 + rand() * 60, 1);
+            padAt(limb[20].clone().add(V3(0, 80, 0)).addScaledVector(side, (rand() - 0.5) * 200), 260 + rand() * 60, 1);
+            padAt(limb[9].clone().add(V3(0, 150, 0)), 230 + rand() * 50, 2);
+            // two forks sweeping off to either side
+            for (const sgn of [-1, 1]) {
+                const i0 = sgn < 0 ? 9 : 16, q0 = limb[i0];
+                const fd = out.clone().multiplyScalar(0.55).addScaledVector(side, sgn * 0.85).normalize();
+                const L = 380 + rand() * 220;
+                // a fork peels away from the limb at a shallow angle, its base flared into a
+                // collar that starts inside the limb, so there is no seam where they meet
+                const along = limb[i0 + 1].clone().sub(limb[i0 - 1]).normalize();
+                const fork = smoothPath([limb[i0 - 2], q0.clone().addScaledVector(along, L * 0.08).addScaledVector(fd, L * 0.1).add(V3(0, 12, 0)),
+                    q0.clone().addScaledVector(fd, L * 0.5).add(V3(0, 90, 0)), q0.clone().addScaledVector(fd, L).add(V3(0, 60 + rand() * 80, 0))], 18);
+                addTube(fork, ridged(fork, 26, 1.5, 6), 12, "#bdb09c");
+                capsule(fork[0], fork[fork.length - 1], 16);
+                skel.push(...fork.slice(3));
+                padAt(fork[fork.length - 1].clone().add(V3(0, 55, 0)), 240 + rand() * 60, 2);
+                padAt(fork[7].clone().add(V3(0, 70, 0)), 200 + rand() * 50, 2);
             }
         }
-        const parts = [{ geo: trunk, color: "#5a4636", shade: (x, y) => 0.7 + 0.3 * Math.sin(y * 0.05 + x * 0.1) * 0.5 + 0.15, glow: (x, y, z) => (Math.sin(Math.atan2(z, x) * 7 + y * 0.012) > 0.93 ? 0.5 : 0) }];
-        const canopyPts = [[0, H + 40, 0]];
-        this.colliders.push({ t: "c", a: [base.x, base.y, base.z], b: [base.x, base.y + H, base.z], r: 80 });
-        // roots
-        for (let i = 0; i < 8; i++) {
-            const a = (i / 8) * Math.PI * 2 + rand() * 0.3;
-            const L = 220 + rand() * 120;
-            const root = new THREE.CylinderGeometry(10, 38, L, 8, 1).translate(0, L / 2, 0);
-            const m = new THREE.Matrix4().makeRotationY(-a).multiply(new THREE.Matrix4().makeRotationZ(-1.25));
-            parts.push({ geo: root, matrix: new THREE.Matrix4().makeTranslation(0, 40, 0).multiply(m), color: "#4d3b2e" });
+        padAt(leader[leader.length - 1].clone().add(V3(0, 40, 0)), 340, 0);
+        padAt(V3(0, H + 330, 0), 380, 1);
+
+        // ---- roots: over the rim and down into the sky ----
+        const rimAt = (a) => {
+            let last = 0;
+            for (let d = 60; d < e.r * 1.6; d += 12) {
+                const x = Math.cos(a) * d, z = Math.sin(a) * d;
+                let solid = false;
+                for (let y = e.h * 1.2; y > -e.h * 0.6; y -= 6) if (entitySDF(e, x, y, z) < 0) { solid = true; break; }
+                if (!solid) break;
+                last = d;
+            }
+            return last;
+        };
+        const local = (wy) => wy - base.y;
+        for (let s = 0; s < S * 3; s++) {
+            const main = s % 3 === 0;
+            const a = (Math.floor(s / 3) / S) * Math.PI * 2 + (main ? 0 : (s % 3 === 1 ? -0.38 : 0.38)) + (rand() - 0.5) * 0.15;
+            const rim = rimAt(a);
+            if (rim < 150) continue;
+            const ctrl = [];
+            const d0 = main ? 150 : 210;
+            for (const f of [0, 0.3, 0.6, 0.85, 1.0]) {
+                const d = d0 + (rim - d0) * f;
+                const x = Math.cos(a) * d, z = Math.sin(a) * d;
+                ctrl.push(V3(x, local(surfaceY(e, x, z)) + (main ? 14 : 6) - f * 4 + (f === 0 ? 30 : 0), z));
+            }
+            const lip = ctrl[ctrl.length - 1];
+            const ox = Math.cos(a), oz = Math.sin(a);
+            const drop = (main ? 650 : 380) + rand() * 420;
+            const sway = (rand() - 0.5) * 2;
+            ctrl.push(V3(lip.x + ox * 40, lip.y - 60, lip.z + oz * 40));
+            ctrl.push(V3(lip.x + ox * 70 + sway * 30, lip.y - drop * 0.35, lip.z + oz * 70 - sway * 20));
+            ctrl.push(V3(lip.x + ox * 60 + sway * 70, lip.y - drop * 0.7, lip.z + oz * 60 + sway * 40));
+            ctrl.push(V3(lip.x + ox * 45 + sway * 50, lip.y - drop, lip.z + oz * 45 + sway * 70));
+            const root = smoothPath(ctrl, main ? 48 : 36);
+            addTube(root, ridged(root, main ? 48 : 26, 3), main ? 12 : 8, "#7a6a58");
+            // a few thin rootlets trailing from the hanging part
+            for (let k = 0; k < (main ? 3 : 1); k++) {
+                const q = root[Math.floor(root.length * (0.55 + rand() * 0.3))];
+                const L = 120 + rand() * 260;
+                const rl = smoothPath([q, q.clone().add(V3((rand() - 0.5) * 60, -L * 0.5, (rand() - 0.5) * 60)), q.clone().add(V3((rand() - 0.5) * 90, -L, (rand() - 0.5) * 90))], 10);
+                addTube(rl, ridged(rl, 7, 1.5), 5, "#7a6a58");
+            }
         }
-        // great branches
-        for (let i = 0; i < 11; i++) {
-            const a = (i / 11) * Math.PI * 2 + rand() * 0.4;
-            const y0 = 520 + rand() * 360;
-            const L = 280 + rand() * 200;
-            const tilt = 0.75 + rand() * 0.45;
-            const br = new THREE.CylinderGeometry(7, 26, L, 8, 1).translate(0, L / 2, 0);
-            const rot = new THREE.Matrix4().makeRotationY(-a).multiply(new THREE.Matrix4().makeRotationZ(-tilt));
-            const mat = new THREE.Matrix4().makeTranslation(0, y0, 0).multiply(rot);
-            parts.push({ geo: br, matrix: mat, color: "#57432f" });
-            const tip = new THREE.Vector3(0, L, 0).applyMatrix4(mat);
-            canopyPts.push([tip.x, tip.y + 20, tip.z]);
-            this.colliders.push({ t: "c", a: [base.x, base.y + y0, base.z], b: [base.x + tip.x, base.y + tip.y, base.z + tip.z], r: 22 });
-        }
-        // canopy clusters
+
+        // ---- the crown ----
+        // Each foliage mass is grown, not stamped: a spray of branches leaves the nearest
+        // limbs and fans out through the mass, and clumps of crossed leaf cards sit along
+        // their outer half, so the crown is airy, with sky and branches showing through.
+        // Pale silver-jade on top, deep teal underneath; the undersides glow at night.
+        const top0 = new THREE.Color("#eafff4"), bot0 = new THREE.Color("#3f8590"), mist = new THREE.Color("#d6c9ff");
+        const tmpC = new THREE.Color();
+        const rq = () => { const u = rand() * 2 - 1, a = rand() * Math.PI * 2, r = Math.sqrt(1 - u * u); return V3(Math.cos(a) * r, u, Math.sin(a) * r); };
         this.tendrilSpots = [];
-        const leaves = [];
-        for (const c of canopyPts) {
-            const r = 120 + rand() * 70;
-            const geo = roughen(new THREE.IcosahedronGeometry(r * 0.85, 2), r * 0.18, 0.02, 9 + canopyPts.indexOf(c));
-            parts.push({
-                geo, matrix: M4(c, [0, rand() * 6, 0], [1, 0.42, 1]), color: "#1d4a33",
-                shade: (x, y) => 0.65 + Math.max(0, y / r) * 0.6,
-                glow: (x, y, z) => (Math.sin(x * 0.09) * Math.sin(z * 0.08) > 0.6 ? 0.5 : 0.04),
-            });
-            this.colliders.push({ t: "s", c: [base.x + c[0], base.y + c[1], base.z + c[2]], r: r * 0.5 });
-            // a shell of leaf-clump cards around each dark core
-            for (let k = 0; k < 46; k++) {
-                const u = rand() * 2 - 1, a = rand() * Math.PI * 2, sq = Math.sqrt(1 - u * u);
-                const d = [Math.cos(a) * sq, Math.abs(u) * 0.75 + 0.1, Math.sin(a) * sq];
-                const p = [c[0] + d[0] * r * 0.95, c[1] + d[1] * r * 0.42, c[2] + d[2] * r * 0.95];
-                const sz = 70 + rand() * 60;
-                const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...d).normalize());
-                q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), rand() * 6.28));
+        for (const pd of pads) {
+            const { c, R } = pd;
+            const thick = R * 0.42;
+            this.colliders.push({ t: "s", c: toWorld(c), r: R * 0.42 });
+            const near = skel.filter((q) => q.distanceTo(c) < R * 1.2);
+            if (!near.length) near.push(skel.reduce((b, q) => (q.distanceTo(c) < b.distanceTo(c) ? q : b), skel[0]));
+            const nb = Math.round(R / 13);
+            for (let k = 0; k < nb; k++) {
+                const start = near[Math.floor(rand() * near.length)];
+                const a = rand() * Math.PI * 2, rr = Math.sqrt(0.15 + 0.85 * rand()) * R * 0.95;
+                const end = V3(c.x + Math.cos(a) * rr, c.y + (rand() - 0.25) * thick * 1.2, c.z + Math.sin(a) * rr);
+                const len = start.distanceTo(end);
+                const m1 = start.clone().lerp(end, 0.33).add(V3(0, len * 0.1, 0)).addScaledVector(rq(), len * 0.1);
+                const m2 = start.clone().lerp(end, 0.7).add(V3(0, len * 0.08, 0)).addScaledVector(rq(), len * 0.08);
+                const br = smoothPath([start, m1, m2, end], 9);
+                addTube(br, ridged(br, Math.min(11, 3 + len * 0.025), 1.0, 3), 5, "#cdc1ad");
+                // leaf clumps along the outer part of the branch
+                const nClumps = Math.max(3, Math.round(len * 0.65 / 19));
+                for (let j = 0; j < nClumps; j++) {
+                    const t = 0.35 + 0.65 * (j + rand() * 0.6) / nClumps;
+                    const i = Math.min(br.length - 1, Math.round(t * (br.length - 1)));
+                    const q = br[i].clone().addScaledVector(rq(), 30);
+                    const h = THREE.MathUtils.clamp((q.y - (c.y - thick)) / (2 * thick), 0, 1);
+                    tmpC.copy(bot0).lerp(top0, Math.pow(h, 0.8));
+                    tmpC.multiplyScalar(0.88 + rand() * 0.24);
+                    if (rand() < 0.1) tmpC.lerp(mist, 0.65);   // a few lavender-silver clumps
+                    const hex = "#" + tmpC.getHexString();
+                    const glow = (1 - h) * 0.45 + (rand() < 0.06 ? 0.5 : 0);
+                    const out = q.clone().sub(c).divideScalar(R).add(V3(0, 0.6, 0));
+                    for (let n = 0; n < 4 + (rand() < 0.5 ? 1 : 0); n++) {
+                        const nrm = rq().addScaledVector(out, 0.9).normalize();
+                        const qq = new THREE.Quaternion().setFromUnitVectors(V3(0, 0, 1), nrm);
+                        qq.multiply(new THREE.Quaternion().setFromAxisAngle(V3(0, 0, 1), rand() * 6.28));
+                        const sz = 42 + rand() * 30;
+                        leaves.push({
+                            geo: new THREE.PlaneGeometry(sz, sz), uvRect: ATLAS_BROADLEAF, normalFrom: [c.x, c.y - thick * 0.6, c.z],
+                            matrix: new THREE.Matrix4().compose(q.clone().addScaledVector(rq(), 8), qq, V3(1, 1, 1)), color: hex, glow,
+                        });
+                    }
+                }
+            }
+            // the fringe: fronds hanging round the rim of the tier
+            const nFr = Math.round(R * 0.05);
+            for (let k = 0; k < nFr; k++) {
+                const a = (k / nFr) * Math.PI * 2 + rand() * 0.2, rr = R * (0.7 + rand() * 0.28);
+                const p = V3(c.x + Math.cos(a) * rr, c.y - thick * 0.25, c.z + Math.sin(a) * rr);
+                const len = 60 + rand() * 80;
+                const q = new THREE.Quaternion().setFromAxisAngle(V3(0, 1, 0), -a + Math.PI / 2 + (rand() - 0.5) * 0.6);
                 leaves.push({
-                    geo: new THREE.PlaneGeometry(sz, sz), uvRect: ATLAS_BROADLEAF, normalFrom: [c[0], c[1] - r * 0.3, c[2]],
-                    matrix: new THREE.Matrix4().compose(new THREE.Vector3(...p), q, new THREE.Vector3(1, 1, 1)),
-                    color: k % 3 ? "#bff2cf" : "#d4ffd8", glow: (x, y, z) => (Math.sin(x * 0.09) * Math.sin(z * 0.08) > 0.6 ? 0.5 : 0.04),
+                    geo: new THREE.PlaneGeometry(len * 0.55, len).translate(0, -len / 2, 0), uvRect: ATLAS_HANGING,
+                    normalFrom: [c.x, c.y + thick, c.z], matrix: new THREE.Matrix4().compose(p, q, V3(1, 1, 1)),
+                    color: "#b9eadf", glow: (x, y) => THREE.MathUtils.clamp((p.y - y) / len, 0, 1) * 0.9,
                 });
             }
-            for (let k = 0; k < 40; k++) {
-                const a = rand() * 6.28, d = Math.sqrt(rand()) * r * 0.9;
-                this.tendrilSpots.push([c[0] + Math.cos(a) * d, c[1] - r * 0.3, c[2] + Math.sin(a) * d, 60 + rand() * 200]);
+            // lantern-fruit and glowing tendrils under the tier
+            for (let k = 0; k < Math.round(R / 22); k++) {
+                const a = rand() * Math.PI * 2, rr = Math.sqrt(rand()) * R * 0.75;
+                fruit.push([c.x + Math.cos(a) * rr, c.y - thick * 0.6 - 10 - rand() * 50, c.z + Math.sin(a) * rr, 2.5 + rand() * 3]);
+            }
+            for (let k = 0; k < Math.round(R / 32); k++) {
+                const a = rand() * Math.PI * 2, rr = Math.sqrt(rand()) * R * 0.85;
+                this.tendrilSpots.push([c.x + Math.cos(a) * rr, c.y - thick * 0.55, c.z + Math.sin(a) * rr, 80 + rand() * 260]);
             }
         }
-        const tree = new THREE.Mesh(buildParts(parts), glowMaterial({ roughness: 0.85 }, "#ff8bd8", false, "bark"));
+
+        const tree = new THREE.Mesh(buildParts(bark), glowMaterial({ roughness: 0.85 }, "#7fe8ff", false, "bark"));
         tree.position.copy(base);
         this.scene.add(tree);
-        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#ff8bd8", textures().leaves));
+        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#8ff3ff", textures().leaves, true, 0.3));
         crown.position.copy(base);
         this.scene.add(crown);
-        // glowing willow tendrils (the reason to come back at night)
-        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.5, 0.25, 1, 4, 8).translate(0, -0.5, 0), color: "#5b8a77", glow: (x, y) => 0.4 - y * 0.6 }]);
-        const im = new THREE.InstancedMesh(tg, glowMaterial({ roughness: 0.8 }, "#ff9fe6"), this.tendrilSpots.length);
+        // glowing tendrils (the reason to come back at night)
+        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.2, 1, 4, 8).translate(0, -0.5, 0), color: "#6a8f9a", glow: (x, y) => 0.35 - y * 0.65 }]);
+        const im = new THREE.InstancedMesh(tg, glowMaterial({ roughness: 0.8 }, "#c39bff"), this.tendrilSpots.length);
         const m4 = new THREE.Matrix4();
-        this.tendrilSpots.forEach((t, i) => {
-            m4.compose(new THREE.Vector3(t[0], t[1], t[2]), new THREE.Quaternion(), new THREE.Vector3(1.4, t[3], 1.4));
-            im.setMatrixAt(i, m4);
-        });
+        this.tendrilSpots.forEach((t, i) => im.setMatrixAt(i, m4.compose(V3(t[0], t[1], t[2]), new THREE.Quaternion(), V3(1.5, t[3], 1.5))));
         im.position.copy(base);
         im.computeBoundingSphere();
         this.scene.add(im);
-        this.treeTop = base.clone().add(new THREE.Vector3(0, H, 0));
+        // lantern-fruit: teardrops on a thread
+        const fg = buildParts([
+            { geo: new THREE.SphereGeometry(1, 10, 8), matrix: M4([0, -1.2, 0], [0, 0, 0], [1, 1.4, 1]), color: "#ffe9b8", glow: 1.2 },
+            { geo: new THREE.CylinderGeometry(0.05, 0.05, 6, 3).translate(0, 3, 0), color: "#6a8f9a", glow: 0.1 },
+        ]);
+        const fm = new THREE.InstancedMesh(fg, glowMaterial({ roughness: 0.4 }, "#ffd89a"), fruit.length);
+        fruit.forEach((f, i) => fm.setMatrixAt(i, m4.compose(V3(f[0], f[1], f[2]), new THREE.Quaternion(), V3(f[3], f[3], f[3]))));
+        fm.position.copy(base);
+        fm.computeBoundingSphere();
+        this.scene.add(fm);
+        this.treeTop = base.clone().add(V3(0, H + 380, 0));
     }
 
     // ---- Titan's Rest: the bones of a giant whale ---------------------------------------

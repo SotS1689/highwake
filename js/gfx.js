@@ -16,7 +16,44 @@ export const shared = {
     uIsl: { value: Array.from({ length: 16 }, () => new THREE.Vector4(0, -1e6, 0, 0)) },
     uIslN: { value: 0 },
     uDragonShade: { value: 1 },   // how much direct sun reaches the dragon (islands overhead)
+    // the dragon's air, for plants: where it is, how fast it moves, and the last downstroke
+    uDragonPos: { value: new THREE.Vector3(0, -1e6, 0) },
+    uDragonVel: { value: new THREE.Vector3() },
+    uBeatPos: { value: new THREE.Vector3(0, -1e6, 0) },
+    uBeatAge: { value: 99 },
+    uBeatAmp: { value: 0 },
 };
+
+// Push (in metres, world space) that the dragon's air gives a plant at world point wp:
+// its wake shoves plants aside and drags them along behind it, lingering a moment after
+// it passes; each downstroke rolls a ring of air outward from beneath the wings.
+// agit (0..2) says how stirred up the air is there, for leaf flutter.
+export const DRAGON_WAKE_GLSL = `
+    uniform vec3 uDragonPos, uDragonVel, uBeatPos; uniform float uBeatAge, uBeatAmp;
+    vec3 dragonWake(vec3 wp, out float agit){
+        agit = 0.0;
+        vec3 to = wp - uDragonPos;
+        float d = length(to);
+        if (d > 320.0) return vec3(0.0);
+        float sp = length(uDragonVel);
+        vec3 vd = sp > 1.0 ? uDragonVel / sp : vec3(0.0, 0.0, 1.0);
+        float along = dot(to, vd);
+        vec3 perp = to - vd * along;
+        float pl = length(perp);
+        vec3 away = pl > 0.5 ? perp / pl : vec3(0.0, -1.0, 0.0);
+        float spK = clamp(sp / 90.0, 0.0, 1.6);
+        float behind = along < 0.0 ? exp(along / 130.0) : exp(-along / 25.0);
+        float wake = exp(-pl * pl / 4900.0) * behind * spK;
+        vec3 push = (away * 0.85 + vd * 0.45 - vec3(0.0, 0.25, 0.0)) * wake * 10.0;
+        vec3 tb = wp - uBeatPos;
+        float db = length(tb.xz);
+        float ringR = 18.0 + uBeatAge * 80.0;
+        float ring = exp(-pow((db - ringR) / 20.0, 2.0)) * exp(-uBeatAge * 1.5) * uBeatAmp
+            * exp(-abs(uBeatPos.y - wp.y) / 140.0);
+        push += vec3(tb.x, 0.0, tb.z) / max(db, 1.0) * ring * 7.0 - vec3(0.0, ring * 2.5, 0.0);
+        agit = clamp(wake + ring * 1.5, 0.0, 2.0);
+        return push * (1.0 + 0.35 * sin(uTime * 9.0 + d * 0.15));
+    }`;
 
 // Islands block the sun as soft discs at their middle height; the shadow's edge softens
 // with distance from the island (the sun isn't a point). Cheap enough to run per pixel.
@@ -266,19 +303,28 @@ export function addWind(m, strength = 1, flutter = true) {
     const base = m.onBeforeCompile;
     m.onBeforeCompile = (sh, r) => {
         base?.call(m, sh, r);
-        sh.uniforms.uTime = shared.uTime;
+        for (const u of ["uTime", "uDragonPos", "uDragonVel", "uBeatPos", "uBeatAge", "uBeatAmp"]) sh.uniforms[u] = shared[u];
         sh.vertexShader = sh.vertexShader
-            .replace("#include <common>", "#include <common>\nuniform float uTime;")
+            .replace("#include <common>", "#include <common>\nuniform float uTime;" + DRAGON_WAKE_GLSL)
             .replace("#include <project_vertex>", `{
                 vec3 ip = vec3(0.0);
+                mat3 om = mat3(modelMatrix);
+                vec3 wpv = (modelMatrix * vec4(transformed, 1.0)).xyz;
                 #ifdef USE_INSTANCING
                 ip = instanceMatrix[3].xyz;
+                om = mat3(modelMatrix * instanceMatrix);
+                wpv = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
                 #endif
                 float k = pow(min(abs(position.y) / 50.0, 1.2), 2.0) * ${strength.toFixed(2)};
+                // a light breeze: slow sway in rolling gusts, with a quicker shiver on top
                 float gust = 0.6 + 0.4 * sin(uTime * 0.37 + ip.x * 0.0021 + ip.z * 0.0017);
                 float sway = sin(uTime * 1.25 + ip.x * 0.013 + ip.z * 0.011) * gust;
-                transformed.x += sway * k * 1.1;
-                transformed.z += cos(uTime * 1.05 + ip.z * 0.012) * gust * k * 0.6;
+                transformed.x += sway * k * 0.8 + sin(uTime * 2.9 + ip.z * 0.03) * k * 0.12;
+                transformed.z += cos(uTime * 1.05 + ip.z * 0.012) * gust * k * 0.45;
+                // the dragon's air, turned from world space into this plant's own space
+                float agit;
+                vec3 pw = dragonWake(wpv, agit);
+                transformed += transpose(om) * pw / max(dot(om[0], om[0]), 1e-4) * k;
                 // leaves (the right half of the tree atlas) flutter on top of the sway
                 #if defined(USE_UV) && ${flutter === "all" ? 2 : flutter ? 1 : 0} == 2
                 float leaf = 1.0;
@@ -288,23 +334,44 @@ export function addWind(m, strength = 1, flutter = true) {
                 float leaf = 0.0;
                 #endif
                 float h = fract(sin(dot(position.xz, vec2(12.9898, 78.233))) * 43758.5453);
-                transformed.y += leaf * sin(uTime * 6.0 + h * 6.28) * 0.18 * (0.3 + gust) * min(k + 0.2, 1.0);
+                transformed.y += leaf * sin(uTime * (6.0 + agit * 6.0) + h * 6.28) * 0.18 * (0.3 + gust + agit * 3.0) * min(k + 0.2, 1.0);
             }
             #include <project_vertex>`);
     };
     const key = m.customProgramCacheKey?.bind(m);
-    m.customProgramCacheKey = () => (key ? key() : "") + "wind" + strength + flutter;
+    m.customProgramCacheKey = () => (key ? key() : "") + "wind2" + strength + flutter;
     return m;
 }
 
 // map: the leaf texture (default: the old tree atlas, leaves on its right half);
 // with the Blender leaves atlas every vertex is leaf and flutters, and the cards are
 // anti-aliased with alpha-to-coverage where the scene is multisampled.
-export function foliageMaterial(glowColor = null, map = null) {
+// recolor: take only the texture's light and shade and let the vertex colours set the
+// hue (the Worldtree's pale silver-jade leaves, from the same green atlas)
+export function foliageMaterial(glowColor = null, map = null, recolor = false, wind = 1) {
     const m = glowMaterial({ roughness: 0.85, map: map || textures().tree, alphaTest: 0.5, side: THREE.DoubleSide, alphaToCoverage: !!map }, glowColor);
     const base = m.onBeforeCompile;
     m.onBeforeCompile = (sh, r) => {
         base(sh, r);
+        if (recolor) sh.fragmentShader = sh.fragmentShader.replace("#include <map_fragment>", `#include <map_fragment>
+            diffuseColor.rgb = vec3(pow(dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11)) * 3.2, 0.85));`);
+        // Leaves are thin: sunlight passes through them. Looking toward the sun through a
+        // canopy, the leaves glow a deeper, warmer colour (forward scattering), and the
+        // side of a clump facing away from the sun still picks up light through the leaves.
+        sh.uniforms.uSunDir = shared.uSunDir;
+        sh.uniforms.uSunColor = shared.uSunColor;
+        sh.fragmentShader = sh.fragmentShader
+            .replace("#include <common>", "#include <common>\nuniform vec3 uSunDir;\nuniform vec3 uSunColor;")
+            .replace("#include <emissivemap_fragment>", `#include <emissivemap_fragment>
+            {
+                vec3 Lv = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
+                vec3 Vv = normalize(vViewPosition);                 // camera to fragment
+                float day = smoothstep(-0.05, 0.2, uSunDir.y);
+                float fwd = pow(clamp(dot(Vv, Lv), 0.0, 1.0), 5.0);  // sun behind the leaves
+                float back = clamp(dot(-normal, Lv), 0.0, 1.0);     // leaf's shaded side
+                vec3 tint = diffuseColor.rgb * mix(vec3(1.0), diffuseColor.rgb * 1.6 + vec3(0.12, 0.1, 0.0), 0.55);
+                totalEmissiveRadiance += tint * uSunColor * (fwd * 1.5 + back * 0.32) * day;
+            }`);
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
         // Blender atlases have soft, antialiased alpha: the alpha test then gives a
         // crisp edge at any magnification (sharpened to one pixel by three's
@@ -326,8 +393,8 @@ export function foliageMaterial(glowColor = null, map = null) {
             #endif
             #include <alphatest_fragment>`);
     };
-    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "");
-    return addWind(m, 1, map ? "all" : true);
+    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "") + (recolor ? "rc" : "") + "sss";
+    return addWind(m, wind, map ? "all" : true);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
 // cells of the Blender leaves atlas (tex/leaves.png, glTF uvs): [u0, v at the card's bottom, u1, v at its top]

@@ -494,136 +494,190 @@ def ao_crown(center, rx, ry, base=0.55):
     return f
 
 
+def smooth_path(ctrl, n):
+    """Catmull-Rom through control points, n samples."""
+    P = [ctrl[0]] + list(ctrl) + [ctrl[-1]]
+    out = []
+    segs = len(ctrl) - 1
+    for k in range(n):
+        u = k / (n - 1) * segs
+        i = min(int(u), segs - 1)
+        t = u - i
+        p0, p1, p2, p3 = P[i], P[i + 1], P[i + 2], P[i + 3]
+        t2, t3 = t * t, t * t * t
+        out.append(0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
+    return out
+
+
+def rand_unit(rnd):
+    while True:
+        v = Vector((rnd.uniform(-1, 1), rnd.uniform(-1, 1), rnd.uniform(-1, 1)))
+        if 0.05 < v.length <= 1:
+            return v.normalized()
+
+
+def deflect(d, rnd, ang_lo, ang_hi, up=0.0):
+    """Turn direction d away from itself by a random angle, around a random axis; then pull up."""
+    side = d.cross(rand_unit(rnd))
+    if side.length < 1e-3:
+        side = d.cross(Vector((1, 0, 0)))
+    side.normalize()
+    a = math.radians(rnd.uniform(ang_lo, ang_hi))
+    n = (d * math.cos(a) + side * math.sin(a) + UP * up).normalized()
+    return n
+
+
+def clump(leaves, rnd, p, crown_c, ao, s, cell=0, n=3, glow=0.0):
+    """A leaf clump: n crossed cards at varied angles, facing broadly out of the crown."""
+    out = p - crown_c
+    out.y *= 0.6
+    out = out.normalized() if out.length > 0.5 else UP
+    for _ in range(n):
+        up = (rand_unit(rnd) * 0.8 + out * 0.6 + UP * 0.55).normalized()
+        face = (out + rand_unit(rnd) * 0.7).normalized()
+        if abs(face.dot(up)) > 0.95:
+            face = (face + rand_unit(rnd)).normalized()
+        w = s * rnd.uniform(0.85, 1.15)
+        card(leaves, p + rand_unit(rnd) * s * 0.25 - up * w * 0.35, up, face, w, w * 0.95, cell, crown_c, ao, glow, bend=0.3, nmix=0.7)
+
+
 def canopy(seed):
-    """Broad-crowned tree: buttress roots, a leaning trunk, limbs that fork out into
-    a wide, layered crown of broadleaf clusters."""
+    """Broad-crowned tree grown as a real branching structure: a curving trunk that flares
+    into roots arching down into the ground, limbs that split into branches and twigs,
+    and leaf clumps at the twig ends, so the crown is lumpy and airy with wood showing
+    through it."""
     rnd = random.Random(seed)
     bark, leaves, lo = Mesh("canopy%d_bark" % seed), Mesh("canopy%d_leaves" % seed), Mesh("canopy%d_lo" % seed)
     H = 48.0
-    lean = Vector((rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1))) * 0.06
-    trunk = grow(Vector((0, -3, 0)), UP + lean, H * 0.62 + 3, 7, rnd, up_pull=0.05, wobble=0.04)
-    tr = [2.6 - 1.5 * (i / 7) ** 0.7 for i in range(8)]
     bark_col = (0.95, 0.9, 0.85)
+    lean = Vector((rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1))) * 0.07
+    # trunk: a gentle S-curve with a swelling base
+    sway = Vector((rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1))) * 1.6
+    ctrl = [Vector((0, -3, 0)), Vector((0, 6, 0)) + sway * 0.4, Vector((0, H * 0.3, 0)) - sway * 0.5 + lean * 10,
+            Vector((0, H * 0.48, 0)) + sway * 0.3 + lean * 18, Vector((0, H * 0.6, 0)) + lean * 26]
+    trunk = smooth_path(ctrl, 12)
+    tr = [2.5 * (1 - 0.5 * (i / 11) ** 0.9) + 1.5 * max(0.0, 1 - i / 2.5) ** 2 for i in range(12)]
     tube(bark, trunk, tr, 10, bark_col)
-    # buttress roots
-    for k in range(5):
-        a = TAU * k / 5 + rnd.uniform(-0.3, 0.3)
-        d = Vector((math.cos(a), -0.55, math.sin(a)))
-        pts = grow(Vector((0, 2.5, 0)) + Vector((math.cos(a), 0, math.sin(a))) * 1.2, d, 7, 3, rnd, wobble=0.05)
-        tube(bark, pts, [1.4, 1.0, 0.6, 0.25], 5, bark_col)
-    crown_c = Vector((0, H * 0.78, 0)) + lean * H * 0.6
-    ao = ao_crown(crown_c, 18, 9, base=0.62)
+    # roots: lobes leaving the trunk's flare, arching out and down into the ground
+    nr = rnd.randint(7, 9)
+    for k in range(nr):
+        a = TAU * k / nr + rnd.uniform(-0.25, 0.25)
+        o = Vector((math.cos(a), 0, math.sin(a)))
+        L = rnd.uniform(5.0, 9.0)
+        pts = smooth_path([Vector((0, 3.0, 0)) + o * 1.2, Vector((0, 1.2, 0)) + o * (L * 0.38), Vector((0, -0.2, 0)) + o * (L * 0.72),
+                           Vector((0, -1.0, 0)) + o * L], 5)
+        tube(bark, pts, [1.25, 1.0, 0.7, 0.38, 0.1], 5, bark_col)
+
+    crown_c = Vector((0, H * 0.74, 0)) + lean * H * 0.6
     tips = []
-    nl = rnd.randint(5, 7)
+
+    def branch(start, d, L, r0, depth):
+        nseg = (4, 3, 2)[depth]
+        pts = grow(start, d, L, nseg, rnd, up_pull=0.05 + 0.03 * depth, wobble=0.14)
+        radii = [r0 * (1 - 0.72 * (i / nseg) ** 0.9) + 0.05 for i in range(nseg + 1)]
+        tube(bark, pts, radii, (6, 4, 3)[depth], bark_col)
+        if depth == 2:
+            tips.append(pts[-1])
+            return
+        kids = rnd.randint(2, 3)
+        for c in range(kids):
+            j = min(nseg, max(1, round(nseg * rnd.uniform(0.45, 1.0))))
+            cd = deflect(d, rnd, 25, 50, up=0.25)
+            branch(pts[j], cd, L * rnd.uniform(0.5, 0.68), radii[j] * 0.72, depth + 1)
+        tips.append(pts[-1])
+
+    nl = rnd.randint(5, 6)
     for k in range(nl):
-        a = TAU * k / nl + rnd.uniform(-0.25, 0.25)
-        i0 = rnd.randint(4, 6)
-        start = trunk[i0]
-        elev = math.radians(rnd.uniform(28, 48))
+        a = TAU * k / nl + rnd.uniform(-0.3, 0.3)
+        i0 = rnd.randint(6, 10)
+        elev = math.radians(rnd.uniform(22, 50))
         d = Vector((math.cos(a) * math.cos(elev), math.sin(elev), math.sin(a) * math.cos(elev)))
-        L = rnd.uniform(14, 19)
-        limb = grow(start, d, L, 4, rnd, up_pull=0.04, wobble=0.1)
-        tube(bark, limb, [tr[i0] * 0.62 * (1 - 0.8 * t / 4) + 0.12 for t in range(5)], 6, bark_col)
-        tips.append((limb[-1], d))
-        # forks off the limb
-        for f in range(rnd.randint(2, 3)):
-            j = rnd.randint(2, 3)
-            fa = a + rnd.choice((-1, 1)) * rnd.uniform(0.5, 1.0)
-            fe = math.radians(rnd.uniform(20, 45))
-            fd = Vector((math.cos(fa) * math.cos(fe), math.sin(fe), math.sin(fa) * math.cos(fe)))
-            fork = grow(limb[j], fd, rnd.uniform(6, 10), 2, rnd, wobble=0.12)
-            tube(bark, fork, [0.45, 0.28, 0.1], 4, bark_col)
-            tips.append((fork[-1], fd))
-    # crown: clusters at every tip, plus a layer filling in between them
-    glow_k = lambda: 0.0
+        branch(trunk[i0], d, rnd.uniform(13, 18), tr[i0] * 0.6, 0)
+    branch(trunk[-1], (UP + lean * 3).normalized(), 10, tr[-1], 1)
+
+    # crown: a clump at every twig end and part-way along, plus a few filling the middle
+    ext = max(((p - crown_c) * Vector((1, 0, 1))).length for p in tips) + 4
+    ao = ao_crown(crown_c, ext, ext * 0.5, base=0.6)
     clusters = []
-    for p, d in tips:
+    for p in tips:
         clusters.append(p)
-        for _ in range(2):
-            clusters.append(p + Vector((rnd.uniform(-3, 3), rnd.uniform(-1, 2.5), rnd.uniform(-3, 3))))
-    for _ in range(10):
-        a = rnd.uniform(0, TAU); r = rnd.uniform(3, 12)
-        clusters.append(crown_c + Vector((math.cos(a) * r, rnd.uniform(1, 5), math.sin(a) * r)))
+        if rnd.random() < 0.6:
+            clusters.append(p + rand_unit(rnd) * 3.0 + UP * 1.0)
+    for _ in range(8):
+        a = rnd.uniform(0, TAU); r = rnd.uniform(2, ext * 0.6)
+        clusters.append(crown_c + Vector((math.cos(a) * r, rnd.uniform(0, 5), math.sin(a) * r)))
     for i, p in enumerate(clusters):
-        out = p - crown_c
-        out.y *= 0.4
-        out = out.normalized() if out.length > 0.5 else UP
-        hz = Vector((out.x, 0, out.z)).normalized() if Vector((out.x, 0, out.z)).length > 0.1 else Vector((1, 0, 0))
-        s = rnd.uniform(9.0, 12.5)
-        g = glow_k()
-        # a low, near-flat card spreading outward, and an upright one facing out
-        side = hz.cross(UP)
-        up1 = (hz + UP * rnd.uniform(0.5, 1.0) + side * rnd.uniform(-0.4, 0.4)).normalized()
-        n1 = (UP * 0.7 + hz * 0.6 + side * rnd.uniform(-0.5, 0.5)).normalized()
-        card(leaves, p - hz * s * 0.25 - UP * 1.0, up1, n1, s, s * 0.9, 0, crown_c, ao, g)
-        up2 = (UP + hz * 0.3 + side * rnd.uniform(-0.5, 0.5)).normalized()
-        card(leaves, p - UP * s * 0.35, up2, (hz + side * rnd.uniform(-0.6, 0.6)).normalized(), s * 0.95, s * 0.95, 0, crown_c, ao, g)
+        s = rnd.uniform(6.0, 8.5)
+        clump(leaves, rnd, p, crown_c, ao, s, 0, 3)
         if i % 3 == 0:
-            # far version: every third cluster, double size
-            card(lo, p - hz * s * 0.4 - UP * 2.0, up1, (UP + hz * 0.4).normalized(), s * 2.0, s * 1.7, 0, crown_c, ao, g, nmix=0.85)
-    # lo trunk: a stub tube on the atlas bark patch
-    tube(lo, [trunk[0], trunk[3], trunk[6]], [2.4, 1.6, 1.0], 5, bark_col, cell=3)
+            out = p - crown_c
+            out.y *= 0.4
+            out = out.normalized() if out.length > 0.5 else UP
+            hz = Vector((out.x, 0, out.z)).normalized() if Vector((out.x, 0, out.z)).length > 0.1 else Vector((1, 0, 0))
+            up1 = (hz + UP * 0.8).normalized()
+            card(lo, p - hz * s * 0.6 - UP * 2.0, up1, (UP + hz * 0.4).normalized(), s * 2.4, s * 2.0, 0, crown_c, ao, 0.0, nmix=0.85)
+    tube(lo, [trunk[0], trunk[5], trunk[11]], [2.6, 1.8, 1.2], 5, bark_col, cell=3)
     return [bark, leaves, lo]
 
 
 def spire(seed):
-    """Tall fir-like tree: a straight, tapering trunk with whorls of drooping limbs
-    clothed in conifer sprays, short at the top and long at the base."""
+    """Tall fir: a straight, tapering trunk with dense whorls of drooping limbs, each
+    clothed in many small sprays, so the silhouette is ragged and layered."""
     rnd = random.Random(seed)
     bark, leaves, lo = Mesh("spire%d_bark" % seed), Mesh("spire%d_leaves" % seed), Mesh("spire%d_lo" % seed)
     H = 54.0
-    trunk = grow(Vector((0, -3, 0)), UP, H + 3, 8, rnd, wobble=0.02)
-    tr = [1.7 * (1 - i / 8) ** 0.9 + 0.08 for i in range(9)]
+    trunk = grow(Vector((0, -3, 0)), UP, H + 3, 9, rnd, wobble=0.02)
+    tr = [1.8 * (1 - i / 9) ** 0.9 + 0.08 + 0.9 * max(0.0, 1 - i / 1.5) ** 2 for i in range(10)]
     col = (0.92, 0.86, 0.8)
-    tube(bark, trunk, tr, 8, col)
+    tube(bark, trunk, tr, 9, col)
     crown_c = Vector((0, H * 0.55, 0))
-    ao = ao_crown(Vector((0, H * 0.5, 0)), 11, 26, base=0.72)
-    y = 9.0
+    ao = ao_crown(Vector((0, H * 0.5, 0)), 11, 26, base=0.68)
+    y = 8.0
     w = 0
-    while y < H - 2:
-        t = (y - 9) / (H - 11)
-        L = 13.5 * (1 - t) ** 1.1 + 2.0
-        n = 6 if t < 0.6 else 4
+    while y < H - 3:
+        t = (y - 8) / (H - 11)
+        L = 13.0 * (1 - t) ** 1.05 + 2.2
+        n = 6 if t < 0.55 else 5
         for k in range(n):
-            a = TAU * (k + 0.5 * (w % 2)) / n + rnd.uniform(-0.2, 0.2)
+            a = TAU * (k + 0.5 * (w % 2)) / n + rnd.uniform(-0.3, 0.3)
             hz = Vector((math.cos(a), 0, math.sin(a)))
-            d = (hz + UP * 0.25).normalized()
-            limb = grow(Vector((0, y, 0)), d, L, 3, rnd, droop=0.55, wobble=0.06)
-            if L > 5:
-                tube(bark, limb, [0.32 * (1 - t) + 0.1, 0.18, 0.1, 0.04], 3, col)
-            # sprays along the limb, lying roughly flat, a little tilted
-            ns = max(1, int(L / 4))
+            d = (hz + UP * rnd.uniform(0.1, 0.35)).normalized()
+            Lk = L * rnd.uniform(0.8, 1.1)
+            limb = grow(Vector((0, y, 0)), d, Lk, 3, rnd, droop=0.6, wobble=0.08)
+            if Lk > 4 and (k + w) % 2 == 0:
+                tube(bark, limb, [0.3 * (1 - t) + 0.1, 0.17, 0.09, 0.03], 3, col)
+            # small sprays all along the limb, lying flat-ish and alternating left/right
+            ns = max(2, int(Lk / 3.7))
             for s in range(ns):
-                j = min(3, 1 + s * 3 // max(ns, 1))
-                p = limb[j - 1].lerp(limb[j], 0.3)
+                f = (s + 0.5) / ns
+                j = min(3, int(f * 3) + 1)
+                p = limb[j - 1].lerp(limb[j], f * 3 - (j - 1))
                 seg = (limb[j] - limb[j - 1]).normalized()
-                sz = min(10.5, L * 0.85 + 2.2)
-                for tilt in (rnd.uniform(-0.6, -0.2), rnd.uniform(0.2, 0.6)):
-                    out = (UP + hz.cross(UP) * tilt + hz * 0.3).normalized()
-                    card(leaves, p, seg, out, sz * 0.85, sz, 1, crown_c, ao, 0.0, bend=-0.12, nmix=0.6)
-        y += 3.6 + 1.2 * t
+                sz = min(9.5, Lk * 0.75 + 3.0) * (1.0 - 0.3 * f)
+                for sgn in (-1, 1):
+                    tilt = rnd.uniform(0.25, 0.65) * sgn
+                    out = (UP + hz.cross(UP) * tilt + hz * 0.25).normalized()
+                    card(leaves, p, (seg + UP * rnd.uniform(-0.15, 0.1)).normalized(), out, sz * 0.85, sz, 1, crown_c, ao, 0.0, bend=-0.15, nmix=0.6)
+        y += 2.9 + 1.1 * t + rnd.uniform(-0.3, 0.3)
         w += 1
-    # a tapered core of crossed sprays through the upper crown, where the limbs are short
+    # a narrow core of crossed sprays so the crown has no hollow middle
     for k in range(3):
         a = k * math.pi / 3 + 0.5
         hz = Vector((math.cos(a), 0, math.sin(a)))
-        card(leaves, Vector((0, H * 0.4, 0)), UP, hz, 17, H * 0.58, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.7)
-    # tip
-    for k in range(2):
-        a = k * math.pi / 2
+        card(leaves, Vector((0, H * 0.35, 0)), UP, hz, 9, H * 0.6, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.7)
+    for k in range(3):
+        a = k * math.pi / 3
         hz = Vector((math.cos(a), 0, math.sin(a)))
-        card(leaves, Vector((0, H - 6, 0)), UP, hz, 4.5, 9, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.5)
-    # far version: the conifer spray is itself a fir silhouette, so three crossed
-    # cards the height of the crown read as the whole tree
+        card(leaves, Vector((0, H - 7, 0)), UP, hz, 4.0, 9, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.5)
+    # far version: crossed cards the height of the crown in two tiers
     for k in range(3):
         a = k * math.pi / 3 + 0.3
         hz = Vector((math.cos(a), 0, math.sin(a)))
-        # a wide lower tier and a narrower upper one, so the far fir has body, not a stalk
-        card(lo, Vector((0, 3.0, 0)), UP, hz, 36, H * 0.72, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
+        card(lo, Vector((0, 3.0, 0)), UP, hz, 34, H * 0.72, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
         b = a + math.pi / 6
         hb = Vector((math.cos(b), 0, math.sin(b)))
-        card(lo, Vector((0, H * 0.42, 0)), UP, hb, 20, H * 0.6, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
-    tube(lo, [trunk[0], trunk[4], trunk[8]], [1.6, 0.9, 0.1], 4, col, cell=3)
+        card(lo, Vector((0, H * 0.42, 0)), UP, hb, 19, H * 0.6, 1, crown_c, ao, 0.0, bend=0.0, nmix=0.8)
+    tube(lo, [trunk[0], trunk[4], trunk[9]], [1.7, 0.9, 0.1], 4, col, cell=3)
     return [bark, leaves, lo]
 
 
@@ -684,8 +738,8 @@ def render_previews(objs):
         for o in objs:
             if o.name.startswith(nm + "_"):
                 o.location = ((i - 1.5) * 45, 60 if o.name.endswith("_lo") else 0, 0)
-    cam.location = (0, -190, 40)
-    cam.rotation_euler = (math.radians(82), 0, 0)
+    cam.location = (0, -300, 34)
+    cam.rotation_euler = (math.radians(86), 0, 0)
     sc.render.filepath = os.path.join(ROOT, "tools", "blender", "renders", "trees.png")
     bpy.ops.render.render(write_still=True)
     log("rendered", sc.render.filepath)

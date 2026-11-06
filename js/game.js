@@ -599,6 +599,7 @@ export class Game {
             if (strike && flying) this.audio.thunder(strike.distanceTo(playerPos));
             this.creatures.update(dt, this.time, playerPos);
         }
+        this._dragonAir(flying, dt);
         this.veg.update(this.camera.position, this.vegRange);
         if (flying) this._sounds(dt, world);
         if (flying) this.ui.hud(this._hudData(world));
@@ -637,6 +638,25 @@ export class Game {
         }
         out.inCloud = p.y < 380 && p.y > -120;
         return out;
+    }
+
+    // Hand the plants the dragon's air: where it is and how fast it goes (its wake), and
+    // each wing downstroke, which rolls a ring of air out from below the dragon.
+    _dragonAir(flying, dt) {
+        const v = this.vessel;
+        if (!flying) {
+            shared.uDragonPos.value.set(0, -1e6, 0);
+            shared.uBeatAmp.value = 0;
+            return;
+        }
+        shared.uDragonPos.value.copy(v.pos);
+        shared.uDragonVel.value.copy(v.vel || v.vdir.clone().multiplyScalar(v.speed));
+        shared.uBeatAge.value += dt;
+        if (v.dragon.beat) {
+            shared.uBeatPos.value.copy(v.pos).addScaledVector(v.up, -12);
+            shared.uBeatAge.value = 0;
+            shared.uBeatAmp.value = (0.6 + v.dragon.amp * 0.6) * (v.boosting ? 1.3 : 1);
+        }
     }
 
     _sounds(dt, world) {
@@ -769,7 +789,7 @@ export class Game {
                 const right = new THREE.Vector3().crossVectors(W.fwd, new THREE.Vector3(0, 1, 0)).normalize();
                 return [W.pos.clone().addScaledVector(right, -330).addScaledVector(W.fwd, -260).add(new THREE.Vector3(0, 60, 0)).toArray(), W.fwd.clone().addScaledVector(right, 0.35).toArray()];
             },
-            tree: () => [[-900, 3300, -3300], [-0.75, -0.08, -0.6]],
+            tree: () => [[-200, 3250, -2650], [-0.77, 0.16, -0.62]],
             storm: () => [[S.x - 3200, S.y + 300, S.z - 600], [1, -0.05, 0.2]],
             under: () => [[350, 500, 1700], [-0.1, 0.55, -0.8]],
             crown: () => [[1500, 4300, 1500], [-0.6, 0.45, -0.6]],
@@ -792,6 +812,17 @@ export class Game {
     // ---- saving ---------------------------------------------------------------------------------
     _load() {
         const blank = { ach: {}, won: {}, gates: GATES.map(() => false), best: {}, awake: false, bond: 0 };
+        // Local testing: every run on localhost starts with the whole game finished
+        // (endless boost, double top speed, aurora). ?fresh=1 plays as a new player;
+        // ?shot= views keep the real save so link-preview images stay unchanged.
+        const q = new URLSearchParams(location.search);
+        const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+        if (isLocal && !q.has("fresh") && !q.has("shot")) {
+            const t = Date.now(), all = (list) => Object.fromEntries(list.map((x) => [x.id, t]));
+            // GATES is still empty here (buildWorld fills it later), so mark plenty as threaded
+            return { ...blank, ach: all(ACHIEVEMENTS), won: all(WONDERS), gates: Array(64).fill(true), awake: true, bond: 20, introduced: true, heardBell: true };
+        }
+        if (isLocal && q.has("fresh")) return blank;
         try {
             const s = JSON.parse(localStorage.getItem(SAVE_KEY));
             if (s && s.ach) return { ...blank, ...s, gates: GATES.map((_, i) => !!(s.gates || [])[i]) };

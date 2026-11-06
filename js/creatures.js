@@ -10,14 +10,22 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // Sculpted creature meshes built in Blender (tools/blender/build_creatures.py). Each
 // carries the attributes the shaders below animate and shade with; without the file
 // the code-built shapes are used instead.
+const ORIGIN = new THREE.Vector3();
+
 export async function loadCreatureModels(url = "models/creatures.glb") {
     const gltf = await new GLTFLoader().loadAsync(url);
     const out = {};
-    const rename = { _GLOW: "glow", _FLEX: "aFlex", _MP: "mp", _FP: "fp" };
+    // Blender's glTF exporter keeps custom attribute names as written (_glow), older
+    // versions upper-cased them (_GLOW): accept either, or the creatures lose their
+    // glow, tail flex and wingbeats.
+    const rename = { _glow: "glow", _flex: "aFlex", _mp: "mp", _fp: "fp" };
     gltf.scene.traverse((o) => {
         if (!o.isMesh) return;
         const g = o.geometry;
-        for (const [from, to] of Object.entries(rename)) if (g.attributes[from]) { g.setAttribute(to, g.attributes[from]); g.deleteAttribute(from); }
+        for (const [from, to] of Object.entries(rename)) {
+            const src = g.attributes[from] || g.attributes[from.toUpperCase()];
+            if (src) { g.setAttribute(to, src); g.deleteAttribute(from); g.deleteAttribute(from.toUpperCase()); }
+        }
         g.computeBoundingSphere();
         out[o.name] = g;
     });
@@ -559,7 +567,9 @@ export class Creatures {
                 const sp = b.v.length();
                 b.v.multiplyScalar(THREE.MathUtils.clamp(sp, 16, 44) / (sp || 1));
                 b.p.addScaledVector(b.v, dt);
-                m4.lookAt(tmp.set(0, 0, 0), tmp.copy(b.v).negate(), THREE.Object3D.DEFAULT_UP);
+                // face along the flight path (+z forward): eye and target must be separate
+                // vectors, or the direction cancels and every bird faces the same way
+                m4.lookAt(ORIGIN, tmp.copy(b.v).negate(), THREE.Object3D.DEFAULT_UP);
                 q.setFromRotationMatrix(m4);
                 m4.compose(b.p, q, one);
                 f.im.setMatrixAt(i, m4);

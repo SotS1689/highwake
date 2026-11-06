@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { entitySDF } from "./world.js";
 import { shared, glowMaterial, foliageMaterial, addWind, buildParts, M4, SHADER_END, textures, UV_BARK as BARK, UV_LEAVES as LEAVES, ATLAS_HANGING } from "./gfx.js";
 import { mulberry32 } from "./noise.js";
+import { addBlossoms, blossomMaterial } from "./blossoms.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // The Blender tree kit (tools/blender/build_trees.py): for each species and variant a
@@ -207,6 +208,30 @@ function vineGeometry(L, seed, lo = false) {
     return { L, strand: buildParts(strands), leaves: buildParts(leaves) };
 }
 
+// Leaf colour per tree, multiplied over the atlas: a painter's range of greens with the
+// odd tree turning gold or russet. Neighbouring trees lean toward the same swatch, so a
+// forest reads as soft patches of colour rather than confetti.
+const BROADLEAF_TINTS = [
+    [[0.4, 0.58, 0.42], 3], [[0.78, 0.7, 0.36], 2], [[0.66, 0.74, 0.62], 2], [[0.34, 0.54, 0.52], 2],
+    [[0.55, 0.66, 0.32], 1.5], [[1.4, 0.88, 0.26], 0.6], [[1.35, 0.5, 0.26], 0.4], [[0.95, 0.92, 0.88], 0.45],
+];
+const CONIFER_TINTS = [[[0.38, 0.56, 0.52], 3], [[0.3, 0.44, 0.38], 2], [[0.55, 0.66, 0.5], 1], [[0.46, 0.56, 0.66], 0.8]];
+function leafTint(ty, x, z, seed, rand) {
+    const list = ty ? CONIFER_TINTS : BROADLEAF_TINTS;
+    const pick = (u) => {
+        let total = 0;
+        for (const [, w] of list) total += w;
+        let a = u * total;
+        for (const [c, w] of list) if ((a -= w) <= 0) return c;
+        return list[0][0];
+    };
+    // a patch value that changes slowly across the island
+    const patch = 0.5 + 0.5 * Math.sin(x * 0.006 + seed * 1.7) * Math.sin(z * 0.0071 - seed * 0.9);
+    const c = pick(rand() < 0.6 ? patch : rand());
+    const b = 0.9 + rand() * 0.2;
+    return new THREE.Color(c[0] * b, c[1] * b, c[2] * b);
+}
+
 class Vegetation {
     constructor(scene, kit) {
         this.scene = scene;
@@ -221,6 +246,9 @@ class Vegetation {
         if (kit) {
             this.leafMat = foliageMaterial(null, textures().leaves);
             this.barkMat = addWind(glowMaterial({ roughness: 0.9, map: textures().bark }), 1, false);
+            // flowers that burst open on the near trees as the dragon passes (blossoms.js)
+            addBlossoms(kit);
+            this.blossomMat = blossomMaterial();
         }
         this.groups = [];
         this.hiRange = 600;      // set from the quality level
@@ -229,9 +257,10 @@ class Vegetation {
         this.CHUNK = 320;        // forest patch size for the near trees
     }
 
-    _instanced(geo, mat, list) {
+    _instanced(geo, mat, list, colors = null) {
         const im = new THREE.InstancedMesh(geo, mat, list.length);
         list.forEach((m, k) => im.setMatrixAt(k, m));
+        if (colors) colors.forEach((c, k) => im.setColorAt(k, c));
         im.computeBoundingSphere();
         this.scene.add(im);
         return im;
@@ -242,6 +271,7 @@ class Vegetation {
         const scaleFor = e.small ? 0.7 : 1;
         const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
         const rand = mulberry32((e.seed || 3) * 17);
+        const tintRand = mulberry32((e.seed || 3) * 29);   // separate, so the forest layout doesn't change
         // sort trees by kind (0 canopy, 1 spire, 2 glow plant) and, with the kit, variant;
         // with the kit, canopy and spire trees are also gathered into forest patches
         const sets = new Map(), chunks = new Map();
@@ -256,7 +286,7 @@ class Vegetation {
             const key = ty * 10 + Math.min(variants - 1, Math.floor(rand() * variants));
             if (!sets.has(key)) sets.set(key, []);
             const list = sets.get(key);
-            const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length };
+            const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length, c: ty < 2 ? leafTint(ty, trees[i], trees[i + 2], e.seed || 3, tintRand) : null };
             list.push(tree);
             if (this.kit && ty < 2) {
                 const ck = Math.floor(trees[i] / this.CHUNK) + "," + Math.floor(trees[i + 2] / this.CHUNK);
@@ -272,7 +302,7 @@ class Vegetation {
             const kitTree = this.kit && ty < 2;
             const geo = kitTree ? this.kit[ty ? "spire" : "canopy"][v].lo : [this.geos.umbrella, this.geos.spire, this.geos.glowPlant][ty];
             const mat = ty === 2 ? this.glowMat : kitTree ? this.leafMat : this.mat;
-            const im = this._instanced(geo, mat, list.map((t) => t.m));
+            const im = this._instanced(geo, mat, list.map((t) => t.m), kitTree ? list.map((t) => t.c) : null);
             group.lo.set(key, im);
             group.meshes.push(im);
         }
@@ -310,7 +340,7 @@ class Vegetation {
         if (!this.kit) return;
         const m = new THREE.Matrix4().makeTranslation(0, -1e5, 0);
         for (const sp of ["canopy", "spire"]) for (const v of this.kit[sp]) {
-            for (const [geo, mat] of [[v.bark, this.barkMat], [v.leaves, this.leafMat]]) this._instanced(geo, mat, [m]).visible = false;
+            for (const [geo, mat] of [[v.bark, this.barkMat], [v.leaves, this.leafMat], [v.blossom, this.blossomMat]]) this._instanced(geo, mat, [m]).visible = false;
         }
     }
 
@@ -318,11 +348,12 @@ class Vegetation {
         c.hi = hi;
         if (hi && !c.meshes) {
             const byKey = new Map();
-            for (const t of c.trees) { if (!byKey.has(t.key)) byKey.set(t.key, []); byKey.get(t.key).push(t.m); }
+            for (const t of c.trees) { if (!byKey.has(t.key)) byKey.set(t.key, []); byKey.get(t.key).push(t); }
             c.meshes = [];
             for (const [key, list] of byKey) {
                 const v = this.kit[Math.floor(key / 10) ? "spire" : "canopy"][key % 10];
-                c.meshes.push(this._instanced(v.bark, this.barkMat, list), this._instanced(v.leaves, this.leafMat, list));
+                c.meshes.push(this._instanced(v.bark, this.barkMat, list.map((t) => t.m)), this._instanced(v.leaves, this.leafMat, list.map((t) => t.m), list.map((t) => t.c)),
+                    this._instanced(v.blossom, this.blossomMat, list.map((t) => t.m)));
             }
         }
         if (c.meshes) for (const m of c.meshes) m.visible = hi;
@@ -383,12 +414,19 @@ function groundMaterial(range) {
                 float f = smoothstep(uGroundRange, uGroundRange * 0.7, distance(gp, cameraPosition));
                 // a gentle sway, more at the tips, then sink into the ground with distance
                 transformed.x += sin(uTime * 1.7 + gp.x * 0.05 + gp.z * 0.04) * position.y * 0.07;
+                // flattened and flicked about by the dragon's air (skim low for a trail)
+                {
+                    float ag;
+                    vec3 pw = dragonWake(gp + vec3(0.0, 2.0, 0.0), ag);
+                    mat3 gm = mat3(modelMatrix * instanceMatrix);
+                    transformed += transpose(gm) * pw / max(dot(gm[0], gm[0]), 1e-4) * clamp(position.y, 0.0, 1.0) * 0.55;
+                }
                 transformed *= f;
             }
             #include <project_vertex>`);
     };
     const key = m.customProgramCacheKey;
-    m.customProgramCacheKey = () => key() + "ground";
+    m.customProgramCacheKey = () => key() + "ground2";
     return m;
 }
 
