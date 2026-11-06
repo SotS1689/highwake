@@ -104,7 +104,7 @@ export class FinalPass extends Pass {
             tScene: { value: null }, tDepth: { value: null }, tCloud: { value: null }, tRays: { value: null }, tBloom: { value: null },
             uClouds: { value: 0 }, uRays: { value: 0 }, uBloom: { value: 0.32 }, uExposure: { value: 1 },
             uInvProj: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() }, uCam: { value: new THREE.Vector3() },
-            uNear: { value: 1 }, uFar: { value: 1000 },
+            uNear: { value: 1 }, uFar: { value: 1000 }, uCTexel: { value: new THREE.Vector2(1, 1) },
             uSunDir: shared.uSunDir, uSunColor: shared.uSunColor, uHaze: shared.uHaze,
             ...grade,
         };
@@ -112,7 +112,25 @@ export class FinalPass extends Pass {
             #include <packing>
             uniform sampler2D tScene, tDepth, tCloud, tRays, tBloom;
             uniform float uClouds, uRays, uBloom, uExposure, uNear, uFar;
-            uniform mat4 uInvProj, uCamWorld; uniform vec3 uCam, uSunDir, uSunColor, uHaze;
+            uniform mat4 uInvProj, uCamWorld; uniform vec3 uCam, uSunDir, uSunColor, uHaze; uniform vec2 uCTexel;
+            float lz(vec2 uv){ float d = texture2D(tDepth, uv).x; return d >= 0.99999 ? 1e7 : -perspectiveDepthToViewZ(d, uNear, uFar); }
+            // The clouds are marched at reduced size. Stretched up plainly, each cloud pixel
+            // straddling the dragon's outline blends clear air into the cloud beside it (and
+            // cloud onto the dragon): a fuzzy halo. Instead, of the four nearest cloud pixels,
+            // lean on the ones marched to about the same depth as this screen pixel.
+            vec4 cloudAt(vec2 uv){
+                vec2 st = uv / uCTexel - 0.5, i0 = floor(st), f = st - i0;
+                float z0 = lz(uv);
+                vec4 acc = vec4(0.0); float ws = 0.0;
+                for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++) {
+                    vec2 tuv = (i0 + vec2(float(i), float(j)) + 0.5) * uCTexel;
+                    float bw = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y) + 1e-3;
+                    float rel = abs(lz(tuv) - z0) / max(min(lz(tuv), z0), 1.0);
+                    float w = bw / (0.01 + rel * rel * 400.0);
+                    acc += texture2D(tCloud, tuv) * w; ws += w;
+                }
+                return acc / ws;
+            }
             uniform float uTime, uSplit, uSat, uContrast, uVignette, uGrain, uFringe;
             uniform vec3 uShadowTint, uHighTint;
             varying vec2 vUv;
@@ -134,7 +152,7 @@ export class FinalPass extends Pass {
                     col = vec3(texture2D(tScene, vUv - o).r, texture2D(tScene, vUv).g, texture2D(tScene, vUv + o).b);
                 } else col = texture2D(tScene, vUv).rgb;
                 if (uClouds > 0.5) {
-                    vec4 cl = texture2D(tCloud, vUv);
+                    vec4 cl = cloudAt(vUv);
                     col = col * cl.a + cl.rgb;
                     // low-lying haze: thickest at the deck, thinning with height, warm toward the sun
                     vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
@@ -174,7 +192,10 @@ export class FinalPass extends Pass {
         u.tScene.value = readBuffer.texture;
         u.tDepth.value = readBuffer.depthTexture;
         u.uClouds.value = this.clouds?.enabled ? 1 : 0;
-        if (u.uClouds.value) u.tCloud.value = this.clouds.texture;
+        if (u.uClouds.value) {
+            u.tCloud.value = this.clouds.texture;
+            u.uCTexel.value.set(1 / this.clouds.target.width, 1 / this.clouds.target.height);
+        }
         u.uRays.value = this.rays?.enabled ? 1 : 0;
         if (u.uRays.value) u.tRays.value = this.rays.target.texture;
         u.tBloom.value = this.bloom.texture;

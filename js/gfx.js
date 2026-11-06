@@ -34,25 +34,33 @@ export const DRAGON_WAKE_GLSL = `
         agit = 0.0;
         vec3 to = wp - uDragonPos;
         float d = length(to);
-        if (d > 320.0) return vec3(0.0);
+        if (d > 560.0) return vec3(0.0);
         float sp = length(uDragonVel);
         vec3 vd = sp > 1.0 ? uDragonVel / sp : vec3(0.0, 0.0, 1.0);
         float along = dot(to, vd);
         vec3 perp = to - vd * along;
         float pl = length(perp);
         vec3 away = pl > 0.5 ? perp / pl : vec3(0.0, -1.0, 0.0);
-        float spK = clamp(sp / 90.0, 0.0, 1.6);
-        float behind = along < 0.0 ? exp(along / 130.0) : exp(-along / 25.0);
-        float wake = exp(-pl * pl / 4900.0) * behind * spK;
-        vec3 push = (away * 0.85 + vd * 0.45 - vec3(0.0, 0.25, 0.0)) * wake * 10.0;
+        float spK = clamp(sp / 80.0, 0.0, 1.8);
+        // the wake: a broad channel of air dragged along behind the dragon
+        float behind = along < 0.0 ? exp(along / 200.0) : 0.0;
+        float wake = exp(-pl * pl / 16900.0) * behind * spK;
+        // the bow wave: air shoved out ahead of the dragon, so plants in front of it lean
+        // away before it arrives (the part the player sees, flying forward)
+        float ahead = along >= 0.0 ? exp(-along / 150.0) * (1.0 - exp(-along / 18.0) * 0.5) : 0.0;
+        float bow = exp(-pl * pl / 22500.0) * ahead * spK;
+        vec3 push = (away * 0.9 + vd * 0.5 - vec3(0.0, 0.3, 0.0)) * wake * 18.0
+                  + (away * 1.0 + vd * 0.35) * bow * 14.0;
         vec3 tb = wp - uBeatPos;
         float db = length(tb.xz);
-        float ringR = 18.0 + uBeatAge * 80.0;
-        float ring = exp(-pow((db - ringR) / 20.0, 2.0)) * exp(-uBeatAge * 1.5) * uBeatAmp
-            * exp(-abs(uBeatPos.y - wp.y) / 140.0);
-        push += vec3(tb.x, 0.0, tb.z) / max(db, 1.0) * ring * 7.0 - vec3(0.0, ring * 2.5, 0.0);
-        agit = clamp(wake + ring * 1.5, 0.0, 2.0);
-        return push * (1.0 + 0.35 * sin(uTime * 9.0 + d * 0.15));
+        float ringR = 20.0 + uBeatAge * 120.0;
+        float ring = exp(-pow((db - ringR) / 34.0, 2.0)) * exp(-uBeatAge * 1.1) * uBeatAmp
+            * exp(-abs(uBeatPos.y - wp.y) / 220.0);
+        push += vec3(tb.x, 0.0, tb.z) / max(db, 1.0) * ring * 15.0 - vec3(0.0, ring * 5.0, 0.0);
+        agit = clamp(wake + bow * 1.2 + ring * 1.8, 0.0, 2.5);
+        // buffeting: the air comes in gusts, not one steady shove
+        float buf = 1.0 + 0.45 * sin(uTime * 7.0 + d * 0.11) * min(agit, 1.0) + 0.25 * sin(uTime * 13.0 + d * 0.23);
+        return push * buf;
     }`;
 
 // Islands block the sun as soft discs at their middle height; the shadow's edge softens
@@ -175,7 +183,7 @@ export function textures() {
     };
     TEX = {
         cliff: get("cliff_c.jpg"), cliffN: get("cliff_n.jpg", false), rock: get("rock_c.jpg"),
-        grass: get("grass_c.jpg"), grassN: get("grass_n.jpg", false), tree: get("tree_atlas.png"), bark: get("bark_c.jpg"),
+        grass: get("grass_c.jpg"), grassN: get("grass_n.jpg", false), tree: get("tree_atlas.png"), bark: get("bark_c.jpg"), barkN: get("bark_n.jpg", false),
         leaves: get("leaves.png"), undergrowth: get("undergrowth.png"), alien: get("alien.png"),
     };
     // the leaves atlases are addressed with glTF uvs (no flip), cells must not bleed into each other
@@ -305,28 +313,62 @@ export function addWind(m, strength = 1, flutter = true) {
         base?.call(m, sh, r);
         for (const u of ["uTime", "uDragonPos", "uDragonVel", "uBeatPos", "uBeatAge", "uBeatAmp"]) sh.uniforms[u] = shared[u];
         sh.vertexShader = sh.vertexShader
-            .replace("#include <common>", "#include <common>\nuniform float uTime;" + DRAGON_WAKE_GLSL)
+            .replace("#include <common>", "#include <common>\nuniform float uTime;" + DRAGON_WAKE_GLSL
+                + (m.userData.cards ? "\nattribute vec3 aStem; attribute float aPhase;" : ""))
             .replace("#include <project_vertex>", `{
-                vec3 ip = vec3(0.0);
+                vec3 ip = modelMatrix[3].xyz;
                 mat3 om = mat3(modelMatrix);
                 vec3 wpv = (modelMatrix * vec4(transformed, 1.0)).xyz;
                 #ifdef USE_INSTANCING
-                ip = instanceMatrix[3].xyz;
+                ip = (modelMatrix * instanceMatrix[3]).xyz;
                 om = mat3(modelMatrix * instanceMatrix);
                 wpv = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
                 #endif
-                float k = pow(min(abs(position.y) / 50.0, 1.2), 2.0) * ${strength.toFixed(2)};
+                float k = pow(min(abs(position.y) / ${(m.userData.windHeight || 50).toFixed(1)}, 1.2), 2.0) * ${strength.toFixed(2)};
                 // a light breeze: slow sway in rolling gusts, with a quicker shiver on top
                 float gust = 0.6 + 0.4 * sin(uTime * 0.37 + ip.x * 0.0021 + ip.z * 0.0017);
                 float sway = sin(uTime * 1.25 + ip.x * 0.013 + ip.z * 0.011) * gust;
+                // the dragon's air, read on the plant's own axis at this vertex's height and
+                // turned into the plant's own space: the whole plant leans away from it as one.
+                // (Read at each vertex, the leaves on either side of the dragon's path slid
+                // apart and the crown swelled like a lens instead of being pushed.)
+                float agit;
+                vec3 pw = dragonWake(vec3(ip.x, wpv.y, ip.z), agit);
+                vec3 pl = transpose(om) * pw / max(dot(om[0], om[0]), 1e-4);
+                ${m.userData.cards ? `{
+                    // each leaf card swings on its own stem, in its own rhythm, and is blown
+                    // back on it, away from the dragon, when the dragon's air reaches it
+                    // (read at the card's own stem, so on a vast crown only the cards the
+                    // dragon actually passes are stirred)
+                    #ifdef USE_INSTANCING
+                    vec3 sw = (modelMatrix * instanceMatrix * vec4(aStem, 1.0)).xyz;
+                    #else
+                    vec3 sw = (modelMatrix * vec4(aStem, 1.0)).xyz;
+                    #endif
+                    float agc;
+                    vec3 plc = transpose(om) * dragonWake(sw, agc) / max(dot(om[0], om[0]), 1e-4);
+                    vec3 off = transformed - aStem;
+                    float ph = aPhase * 6.2832;
+                    float ag = agc * (0.55 + 0.9 * aPhase);
+                    // the breeze's own swing and shiver, then the dragon's air: a stronger flutter
+                    // at a steady rhythm of its own (only its strength follows the air; letting
+                    // the air speed up the rhythm made the phase race as the dragon passed)
+                    float a1 = sin(uTime * (2.1 + aPhase * 1.8) + ph) * (0.05 + 0.05 * gust + ag * 0.1)
+                             + sin(uTime * (5.3 + aPhase * 2.9) + ph * 2.3) * 0.015
+                             + sin(uTime * (3.4 + aPhase * 1.6) + ph * 1.7) * ag * 0.13;
+                    vec3 ax = normalize(vec3(cos(ph * 3.0), 0.35 * sin(ph * 5.0), sin(ph * 3.0)));
+                    off = off * cos(a1) + cross(ax, off) * sin(a1) + ax * dot(ax, off) * (1.0 - cos(a1));
+                    float L = length(off), pm = length(plc);
+                    if (L > 1e-3 && pm > 1e-3) off = normalize(off + plc / pm * L * min(ag, 1.3) * 0.55) * L;
+                    transformed = aStem + off;
+                }` : ""}
                 transformed.x += sway * k * 0.8 + sin(uTime * 2.9 + ip.z * 0.03) * k * 0.12;
                 transformed.z += cos(uTime * 1.05 + ip.z * 0.012) * gust * k * 0.45;
-                // the dragon's air, turned from world space into this plant's own space
-                float agit;
-                vec3 pw = dragonWake(wpv, agit);
-                transformed += transpose(om) * pw / max(dot(om[0], om[0]), 1e-4) * k;
+                transformed += pl * k;
                 // leaves (the right half of the tree atlas) flutter on top of the sway
-                #if defined(USE_UV) && ${flutter === "all" ? 2 : flutter ? 1 : 0} == 2
+                #if ${m.userData.cards ? 1 : 0}
+                float leaf = 0.0;   // leaf cards already move on their stems
+                #elif defined(USE_UV) && ${flutter === "all" ? 2 : flutter ? 1 : 0} == 2
                 float leaf = 1.0;
                 #elif defined(USE_UV) && ${flutter ? 1 : 0}
                 float leaf = step(0.5, uv.x);
@@ -334,12 +376,12 @@ export function addWind(m, strength = 1, flutter = true) {
                 float leaf = 0.0;
                 #endif
                 float h = fract(sin(dot(position.xz, vec2(12.9898, 78.233))) * 43758.5453);
-                transformed.y += leaf * sin(uTime * (6.0 + agit * 6.0) + h * 6.28) * 0.18 * (0.3 + gust + agit * 3.0) * min(k + 0.2, 1.0);
+                transformed.y += leaf * (sin(uTime * 6.0 + h * 6.28) * (0.3 + gust) + sin(uTime * 4.5 + h * 6.28) * agit * 3.0) * 0.18 * min(k + 0.2, 1.0);
             }
             #include <project_vertex>`);
     };
     const key = m.customProgramCacheKey?.bind(m);
-    m.customProgramCacheKey = () => (key ? key() : "") + "wind2" + strength + flutter;
+    m.customProgramCacheKey = () => (key ? key() : "") + "wind3" + strength + flutter + (m.userData.windHeight || 50) + (m.userData.cards ? "cards" : "");
     return m;
 }
 
@@ -371,10 +413,12 @@ export function foliageMaterial(glowColor = null, map = null, recolor = false, w
                 vec3 Lv = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
                 vec3 Vv = normalize(vViewPosition);                 // camera to fragment
                 float day = smoothstep(-0.05, 0.2, uSunDir.y);
-                float fwd = pow(clamp(dot(Vv, Lv), 0.0, 1.0), 5.0);  // sun behind the leaves
+                float fwd = pow(clamp(dot(Vv, Lv), 0.0, 1.0), 4.0);  // sun behind the leaves
                 float back = clamp(dot(-normal, Lv), 0.0, 1.0);     // leaf's shaded side
-                vec3 tint = diffuseColor.rgb * mix(vec3(1.0), diffuseColor.rgb * 1.6 + vec3(0.12, 0.1, 0.0), 0.55);
-                totalEmissiveRadiance += tint * uSunColor * (fwd * 1.5 + back * 0.32) * day;
+                // like a Translucent BSDF added to the leaf shader: light coming through a
+                // thin leaf takes on its colour, deeper and a little warmer
+                vec3 tint = diffuseColor.rgb * mix(vec3(1.0), diffuseColor.rgb * 1.7 + vec3(0.14, 0.1, 0.0), 0.6);
+                totalEmissiveRadiance += tint * uSunColor * (fwd * 2.0 + back * 0.5) * day;
             }`);
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
         // Blender atlases have soft, antialiased alpha: the alpha test then gives a
@@ -410,28 +454,47 @@ export const ALIEN_FAN = [0.004, 0.496, 0.496, 0.004], ALIEN_PLUME = [0.504, 0.4
 
 // Build one non-indexed geometry from parts, each with a flat colour and glow
 export function buildParts(parts) {
-    const pos = [], nrm = [], col = [], glw = [], uvs = [];
+    const pos = [], nrm = [], col = [], glw = [], uvs = [], stems = [], phases = [];
     const c = new THREE.Color();
+    // stem: [x, y, z] where a leaf card attaches (it then swings on it in the wind shader,
+    // material.userData.cards); phase: its own 0..1 rhythm
+    const anyStem = parts.some((p) => p.stem);
     for (const p of parts) {
         // indexed shapes keep smooth normals; already-split ones (roughened rock) stay faceted
         let g = p.geo.clone();
         if (p.matrix) g.applyMatrix4(p.matrix);
-        g.computeVertexNormals();
+        if (!p.keepNormals || !g.attributes.normal) g.computeVertexNormals();
         if (g.index) g = g.toNonIndexed();
         const P = g.attributes.position, N = g.attributes.normal, U = g.attributes.uv;
         const r = p.uvRect || [0, 0, 1, 1];
         c.set(p.color);
+        const cl = p.collar;   // { a, d, r }: a branch growing out of a parent (axis point, direction, radius)
         for (let i = 0; i < P.count; i++) {
             pos.push(P.getX(i), P.getY(i), P.getZ(i));
             // normalFrom: point normals away from a centre (soft, rounded foliage)
             if (p.normalFrom) {
                 const [cx, cy, cz] = p.normalFrom, dx = P.getX(i) - cx, dy = P.getY(i) - cy, dz = P.getZ(i) - cz, l = Math.hypot(dx, dy, dz) || 1;
                 nrm.push(dx / l, dy / l, dz / l);
+            } else if (cl) {
+                // near the parent, bend the normal toward the parent's own surface normal so
+                // the branch flows out of it with no crease in the shading
+                const qx = P.getX(i) - cl.a.x, qy = P.getY(i) - cl.a.y, qz = P.getZ(i) - cl.a.z;
+                const al = qx * cl.d.x + qy * cl.d.y + qz * cl.d.z;
+                const rx = qx - cl.d.x * al, ry = qy - cl.d.y * al, rz = qz - cl.d.z * al, h = Math.hypot(rx, ry, rz) || 1;
+                const x = THREE.MathUtils.clamp((h - cl.r * 0.45) / (cl.r * 1.5), 0, 1);
+                const w = (1 - x * x * (3 - 2 * x)) * 0.85 * (Math.abs(al) < cl.r * 3 ? 1 : 0);
+                let nx = N.getX(i) * (1 - w) + (rx / h) * w, ny = N.getY(i) * (1 - w) + (ry / h) * w, nz = N.getZ(i) * (1 - w) + (rz / h) * w;
+                const l = Math.hypot(nx, ny, nz) || 1;
+                nrm.push(nx / l, ny / l, nz / l);
             } else nrm.push(N.getX(i), N.getY(i), N.getZ(i));
             uvs.push(U ? r[0] + U.getX(i) * (r[2] - r[0]) : 0, U ? r[1] + U.getY(i) * (r[3] - r[1]) : 0);
             const shade = p.shade ? p.shade(P.getX(i), P.getY(i), P.getZ(i)) : 1;
             col.push(c.r * shade, c.g * shade, c.b * shade);
             glw.push(typeof p.glow === "function" ? p.glow(P.getX(i), P.getY(i), P.getZ(i)) : p.glow || 0);
+            if (anyStem) {
+                if (p.stem) stems.push(p.stem[0], p.stem[1], p.stem[2]); else stems.push(P.getX(i), P.getY(i), P.getZ(i));
+                phases.push(p.phase || 0);
+            }
         }
     }
     const geo = new THREE.BufferGeometry();
@@ -440,6 +503,10 @@ export function buildParts(parts) {
     geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
     geo.setAttribute("glow", new THREE.Float32BufferAttribute(glw, 1));
     geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+    if (anyStem) {
+        geo.setAttribute("aStem", new THREE.Float32BufferAttribute(stems, 3));
+        geo.setAttribute("aPhase", new THREE.Float32BufferAttribute(phases, 1));
+    }
     geo.computeBoundingSphere();
     return geo;
 }

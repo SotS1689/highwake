@@ -814,6 +814,9 @@ export class Dragon {
         // flap hard while boosting; an easy beat when slow or climbing; otherwise glide
         let want = st.boosting ? 1 : st.speed < 45 || st.climb > 0.55 ? 0.5 : 0;
         if (st.brake) want = 0;
+        // hovering: a strong, steady beat holds the dragon up (and replaces the brake flare)
+        const hov = st.hover || 0;
+        want = want * (1 - hov) + 0.85 * hov;
         this.amp += (want - this.amp) * Math.min(1, dt * (want > this.amp ? 4 : 1.5));
         const freq = 0.75 + this.amp * 1.0;
         const before = Math.sin(this.phase);
@@ -824,7 +827,7 @@ export class Dragon {
         this.beat = before <= 0 && Math.sin(this.phase) > 0 && this.amp > 0.4;
         // the wings flare into the air-brake and sweep back out of it on a damped spring,
         // overshooting a touch as the membrane catches the air
-        const bw = st.brake ? 1 : 0, sk = st.brake ? 90 : 45, sd = st.brake ? 11 : 12;
+        const bw = st.brake ? 1 - hov : 0, sk = st.brake ? 90 : 45, sd = st.brake ? 11 : 12;
         const h = Math.min(dt, 1 / 30);
         this.brakeVel += ((bw - this.brakeAmt) * sk - this.brakeVel * sd) * h;
         this.brakeAmt = Math.max(-0.1, Math.min(1.15, this.brakeAmt + this.brakeVel * h));

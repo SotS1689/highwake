@@ -32,8 +32,8 @@ export const ACHIEVEMENTS = [
     { id: "roll", name: "Barrel Roll", text: "Roll all the way around.", icon: "⟲" },
     { id: "daredevil", name: "Rock Kisser", text: "Skim within a wingspan of rock at speed for two seconds.", icon: "⚠" },
     { id: "cloudskim", name: "Cloud Skimmer", text: "Fly low over the sea of clouds for five seconds.", icon: "☁" },
-    { id: "thin_air", name: "Thin Air", text: "Climb above 6,000 metres.", icon: "▲" },
-    { id: "falling_star", name: "Falling Star", text: "Reach 150 m/s in a beating dive.", icon: "✧" },
+    { id: "thin_air", name: "Thin Air", text: "Climb above 18,000 feet.", icon: "▲" },
+    { id: "falling_star", name: "Falling Star", text: "Reach 246 ft/s in a beating dive.", icon: "✧" },
     { id: "veil", name: "Through the Veil", text: "Fly through a waterfall.", icon: "⫶" },
     { id: "wanderer", name: "Wanderer", text: "Discover four wonders.", icon: "✺" },
     { id: "wonder_seeker", name: "Wonder-Seeker", text: "Discover all eight wonders.", icon: "✹" },
@@ -44,10 +44,10 @@ const SAVE_KEY = "highwake.save.v1";
 
 // msaa: anti-aliasing samples for the scene; cloudScale: size of the cloud raymarch
 const QUALITY = {
-    low: { ground: 0, treeHi: 250, px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0, msaa: 0 },
-    medium: { ground: 220, treeHi: 450, px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0, msaa: 2 },
-    high: { ground: 320, treeHi: 650, px: 1.25, bloom: true, veg: 9000, shadow: 2048, rays: 32, clouds: 24, cloudScale: 0.4, msaa: 2 },
-    ultra: { ground: 480, treeHi: 1000, px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 64, clouds: 40, cloudScale: 0.5, msaa: 4 },
+    low: { ground: 0, treeHi: 140, px: 0.75, bloom: false, veg: 3500, shadow: 0, rays: 0, clouds: 0, msaa: 0 },
+    medium: { ground: 220, treeHi: 240, px: 1, bloom: true, veg: 6000, shadow: 1024, rays: 0, grain: 0, clouds: 0, msaa: 2 },
+    high: { ground: 320, treeHi: 330, px: 1.25, bloom: true, veg: 9000, shadow: 2048, rays: 32, clouds: 24, cloudScale: 0.4, msaa: 2 },
+    ultra: { ground: 480, treeHi: 500, px: 2, bloom: true, veg: 14000, shadow: 4096, rays: 64, clouds: 40, cloudScale: 0.5, msaa: 4 },
 };
 
 export class Game {
@@ -158,7 +158,7 @@ export class Game {
         this.camera.updateMatrixWorld();
         this.sky.update(0, this.camera);
         this.land.update(this.camera);
-        this.veg.update(this.camera.position, this.vegRange);
+        this.veg.update(this.camera.position, this.vegRange, this.camera);
         const draw = () => { this.cine?.update(this.camera, 0, this.time, 0); if (this.useComposer) this.composer.render(); else this.renderer.render(this.scene, this.camera); };
         const measure = () => {
             draw(); draw(); sync();
@@ -175,7 +175,7 @@ export class Game {
             this.settings.quality = qName;
             this.renderScale = scale;
             this.applyQuality();
-            this.veg.update(this.camera.position, this.vegRange);
+            this.veg.update(this.camera.position, this.vegRange, this.camera);
             lastMs = measure();
             if (lastMs <= BUDGET) { pick = [qName, scale]; break; }
             await new Promise((r) => setTimeout(r, 0));
@@ -600,7 +600,7 @@ export class Game {
             this.creatures.update(dt, this.time, playerPos);
         }
         this._dragonAir(flying, dt);
-        this.veg.update(this.camera.position, this.vegRange);
+        this.veg.update(this.camera.position, this.vegRange, this.camera);
         if (flying) this._sounds(dt, world);
         if (flying) this.ui.hud(this._hudData(world));
 
@@ -790,6 +790,12 @@ export class Game {
                 return [W.pos.clone().addScaledVector(right, -330).addScaledVector(W.fwd, -260).add(new THREE.Vector3(0, 60, 0)).toArray(), W.fwd.clone().addScaledVector(right, 0.35).toArray()];
             },
             tree: () => [[-200, 3250, -2650], [-0.77, 0.16, -0.62]],
+            // any view: ?shot=at&p=x,y,z&d=dx,dy,dz (for judging close detail)
+            at: () => {
+                const q = new URLSearchParams(location.search);
+                const v = (k, def) => (q.get(k) || def).split(",").map(Number);
+                return [v("p", "0,2000,0"), new THREE.Vector3(...v("d", "0,0,1")).normalize().toArray()];
+            },
             storm: () => [[S.x - 3200, S.y + 300, S.z - 600], [1, -0.05, 0.2]],
             under: () => [[350, 500, 1700], [-0.1, 0.55, -0.8]],
             crown: () => [[1500, 4300, 1500], [-0.6, 0.45, -0.6]],

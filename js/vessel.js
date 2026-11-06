@@ -107,6 +107,8 @@ export class Vessel {
         this.fwd = new THREE.Vector3(); this.up = new THREE.Vector3(); this.right = new THREE.Vector3();
         this.extVel = new THREE.Vector3();
         this.bank = 0;
+        this.hover = 0;          // 0..1: stopped in the air, held up on the wingbeats
+        this.hoverClimb = 0;     // m/s up (or down) while hovering, from the pitch stick
         this.trails = new Trails(scene);
         this.streaks = new Streaks(scene);
         this._axes();
@@ -119,6 +121,7 @@ export class Vessel {
         this.q.setFromRotationMatrix(m);
         this.vdir.copy(f);
         this.speed = 70;
+        this.hover = 0; this.hoverClimb = 0;
         this.rates.set(0, 0, 0);
         this.extVel.set(0, 0, 0);
         this._axes();
@@ -136,6 +139,14 @@ export class Vessel {
     update(dt, inp, settings, world) {
         // throttle
         this.throttle = THREE.MathUtils.clamp(this.throttle + inp.thr * dt * 0.6, 0, 1);
+        // hover: throttle right down and the air-brake held, the dragon pulls up, stops and
+        // holds itself in the air on strong wingbeats. It can still turn on the spot, and
+        // the pitch stick lifts it or lets it sink. Let go of the brake (or open the
+        // throttle) and it noses over and flies on.
+        const hoverWant = inp.brake && this.throttle < 0.04 ? 1 : 0;
+        this.hover += (hoverWant - this.hover) * Math.min(1, dt * (hoverWant ? 0.9 : 1.6));
+        if (this.hover < 0.002) this.hover = 0;
+        const hv = this.hover;
 
         // rotation rates (smoothed)
         const steep = Math.abs(this.fwd.y);
@@ -151,7 +162,8 @@ export class Vessel {
             err = Math.atan2(Math.sin(err), Math.cos(err));
             roll = THREE.MathUtils.clamp(err * levelPull, -2.4, 2.4);
         }
-        const pitch = inp.stickY * 1.45;
+        const pitch = inp.stickY * 1.45 * (1 - hv);
+        if (hv > 0) roll *= 1 - hv;
         const yaw = inp.stickX * 0.75 + inp.rudder * 0.55;
         const k = Math.min(1, dt * 7);
         this.rates.x += (pitch - this.rates.x) * k;
@@ -166,6 +178,21 @@ export class Vessel {
         this.q.premultiply(qa.setFromAxisAngle(this.fwd, this.rates.z * dt));
         this.q.normalize();
         this._axes();
+        // hovering, the body settles level-winged with the nose raised a little, facing
+        // wherever it was heading
+        const flat = this._flat || (this._flat = new THREE.Vector3());
+        flat.set(this.fwd.x, 0, this.fwd.z);
+        if (flat.lengthSq() < 0.01) flat.set(this.vdir.x, 0, this.vdir.z);
+        if (flat.lengthSq() < 1e-6) flat.set(0, 0, 1);
+        flat.normalize();
+        if (hv > 0) {
+            // (leaving the hover, it noses over a touch to pick up speed again)
+            const P = hoverWant ? 0.3 : -0.12;
+            const f = flat.clone().multiplyScalar(Math.cos(P)).addScaledVector(UP, Math.sin(P));
+            const qt = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(new THREE.Vector3(), f.negate(), UP));
+            this.q.slerp(qt, Math.min(1, dt * 2.5 * hv)).normalize();
+            this._axes();
+        }
 
         // speed: thrust, drag, gravity along the flight path
         const thin = THREE.MathUtils.clamp(1 - (this.pos.y - 5600) / 2600, 0.15, 1);
@@ -178,34 +205,41 @@ export class Vessel {
         if (this.crowned) this.boost = 1;
         // top speed goes as sqrt(thrust / drag), so a quarter of the drag doubles it
         const drag = 0.0012 * (inp.brake ? 5 : this.crowned ? 0.25 : 1);
-        this.speed += (thrust - drag * this.speed * this.speed - 20 * this.vdir.y) * dt;
-        this.speed = Math.max(this.speed, 18);
+        this.speed += (thrust * (1 - hv) - drag * this.speed * this.speed - 20 * this.vdir.y * (1 - hv)) * dt;
+        // hovering, the wings hold the air and the last of the speed bleeds away
+        this.speed -= this.speed * hv * dt * 1.5;
+        this.speed = Math.max(this.speed, 18 * (1 - hv));
 
-        // flight path follows the nose with a little slip
+        // flight path follows the nose with a little slip (level, hovering)
         const grip = THREE.MathUtils.lerp(4.5, 2.2, THREE.MathUtils.clamp((this.speed - 60) / 120, 0, 1));
-        this.vdir.lerp(this.fwd, Math.min(1, dt * grip)).normalize();
+        this.vdir.lerp(hv > 0 ? this.fwd.clone().lerp(flat, hv) : this.fwd, Math.min(1, dt * grip)).normalize();
 
         // outside forces: rising air, storm wind, the edge of the world, the ceiling
         const ext = this.extVel;
         ext.multiplyScalar(Math.max(0, 1 - dt * 1.2));
         if (world.wind) ext.addScaledVector(world.wind, dt);
         if (world.thermalLift) ext.y += world.thermalLift * dt;
-        const flat = Math.hypot(this.pos.x, this.pos.z);
-        if (flat > BOUNDARY) {
-            const push = (flat - BOUNDARY) * 0.02;
-            ext.x -= (this.pos.x / flat) * push * dt * 20;
-            ext.z -= (this.pos.z / flat) * push * dt * 20;
+        const fr = Math.hypot(this.pos.x, this.pos.z);
+        if (fr > BOUNDARY) {
+            const push = (fr - BOUNDARY) * 0.02;
+            ext.x -= (this.pos.x / fr) * push * dt * 20;
+            ext.z -= (this.pos.z / fr) * push * dt * 20;
         }
         if (this.pos.y > CEILING) ext.y -= (this.pos.y - CEILING) * dt * 0.3;
         // below the cloud deck the air thickens and lifts you back up
         if (this.pos.y < -1500) ext.y += (-1500 - this.pos.y) * dt * 0.6;
 
         this.vel = this.vdir.clone().multiplyScalar(this.speed).add(ext);
+        if (hv > 0) {
+            // climb or sink on the pitch stick, and bob: each downstroke lifts a little
+            this.hoverClimb += (inp.stickY * 14 - this.hoverClimb) * Math.min(1, dt * 3);
+            this.vel.y += (this.hoverClimb + (this.dragon.downstroke - 0.3) * 4) * hv;
+        } else this.hoverClimb = 0;
         this.pos.addScaledVector(this.vel, dt);
 
         this.group.position.copy(this.pos);
         this.group.quaternion.copy(this.q);
-        this.dragon.update(dt, { speed: this.speed, boosting: this.boosting, brake: inp.brake, rates: this.rates, climb: this.fwd.y });
+        this.dragon.update(dt, { speed: this.speed, boosting: this.boosting, brake: inp.brake, rates: this.rates, climb: this.fwd.y, hover: hv });
         this.trails.update(this, dt);
     }
 
@@ -362,7 +396,8 @@ export class ChaseCamera {
         const steep = Math.abs(v.fwd.y);
         const upWant = settings.camroll ? v.up.clone() : UP.clone().lerp(v.up, THREE.MathUtils.smoothstep(steep, 0.6, 0.9) + (v.up.y < 0 ? 1 : 0)).normalize();
         this.up.lerp(upWant, 1 - Math.exp(-dt * 4)).normalize();
-        const look = v.pos.clone().addScaledVector(v.fwd, 40);
+        // (hovering, look along the heading rather than up the raised nose)
+        const look = v.pos.clone().addScaledVector(v.hover > 0 ? v.fwd.clone().lerp(v.vdir, v.hover) : v.fwd, 40);
         this.cam.position.copy(this.pos);
         if (this.shake > 0) {
             this.cam.position.add(new THREE.Vector3((Math.random() - 0.5), (Math.random() - 0.5), (Math.random() - 0.5)).multiplyScalar(this.shake));

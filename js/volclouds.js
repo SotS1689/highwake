@@ -58,14 +58,10 @@ const shader = {
             vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
             vec3 vdir = normalize(vp.xyz / vp.w);
             vec3 D = normalize(mat3(uCamWorld) * vdir);
-            #ifdef MARCH
-            // this half-res pixel covers 2x2 scene pixels: stop at the nearest of them, so
-            // cloud never smears over the edge of something in front of it
-            float depth = min(min(texture2D(tDepth, vUv + uTexel * vec2(-0.5, -0.5)).x, texture2D(tDepth, vUv + uTexel * vec2(0.5, -0.5)).x),
-                              min(texture2D(tDepth, vUv + uTexel * vec2(-0.5, 0.5)).x, texture2D(tDepth, vUv + uTexel * vec2(0.5, 0.5)).x));
-            #else
+            // (march: the scene depth at exactly this reduced pixel's centre, the same sample
+            // the final pass's depth-aware upsampling compares against, so each cloud pixel
+            // is matched to the surface it was marched to)
             float depth = texture2D(tDepth, vUv).x;
-            #endif
             float tScene = depth >= 0.99999 ? 1e9 : perspectiveDepthToViewZ(depth, uNear, uFar) / vdir.z;
 
             #ifdef MARCH
@@ -153,15 +149,23 @@ const resolveShader = {
         uniform vec3 uCam; uniform float uNear, uFar, uReset; uniform vec2 uTexel;
         varying vec2 vUv;
         const float YB = ${DECK_BASE.toFixed(1)}, YT = ${DECK_TOP.toFixed(1)};
+        float lz(vec2 uv){ float d = texture2D(tDepth, uv).x; return d >= 0.99999 ? 1e7 : -perspectiveDepthToViewZ(d, uNear, uFar); }
         void main(){
             vec4 cur = texture2D(tCur, vUv);
             vec4 mn = cur, mx = cur, m1 = vec4(0.0), m2 = vec4(0.0);
+            // the neighbourhood the history is clamped to only counts pixels at about this
+            // pixel's depth: next to the dragon, the clear air in front of it mustn't widen
+            // the range and let a ghost of its outline smear across the streaming cloud
+            float z0 = lz(vUv), n = 0.0;
             for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
-                vec4 c = texture2D(tCur, vUv + vec2(float(x), float(y)) * uTexel);
-                mn = min(mn, c); mx = max(mx, c); m1 += c; m2 += c * c;
+                vec2 o = vec2(float(x), float(y)) * uTexel;
+                float z = lz(vUv + o);
+                if (abs(z - z0) > 0.08 * min(z, z0)) continue;
+                vec4 c = texture2D(tCur, vUv + o);
+                mn = min(mn, c); mx = max(mx, c); m1 += c; m2 += c * c; n += 1.0;
             }
             // variance clip: tighter than min/max, so stale cloud can't linger
-            m1 /= 9.0; vec4 sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+            m1 /= n; vec4 sd = sqrt(max(m2 / n - m1 * m1, 0.0));
             mn = max(mn, m1 - 1.25 * sd); mx = min(mx, m1 + 1.25 * sd);
             if (uReset > 0.5) { gl_FragColor = cur; return; }
             // where was this pixel's cloud last frame? use the point where the ray enters the

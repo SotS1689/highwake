@@ -10,6 +10,22 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // The Blender tree kit (tools/blender/build_trees.py): for each species and variant a
 // near version (bark + leaf cards) and a far version (a few big cards on the atlas).
 // ?trees=classic keeps the old code-built trees.
+// Drop the triangles drawn from the filament-curtain cell of the alien atlas (the left
+// half of its lower row) from a far tree, as leafCards does for the near ones.
+function dropCurtains(geo) {
+    const U = geo.attributes.uv;
+    if (!U) return geo;
+    const I = geo.index ? geo.index.array : Array.from({ length: geo.attributes.position.count }, (_, i) => i);
+    const keep = [];
+    for (let t = 0; t < I.length; t += 3) {
+        const u = (U.getX(I[t]) + U.getX(I[t + 1]) + U.getX(I[t + 2])) / 3, v = (U.getY(I[t]) + U.getY(I[t + 1]) + U.getY(I[t + 2])) / 3;
+        if (!(u < 0.5 && v > 0.5)) keep.push(I[t], I[t + 1], I[t + 2]);
+    }
+    geo.setIndex(keep);
+    geo.computeBoundingSphere();
+    return geo;
+}
+
 async function loadTreeModels() {
     if (new URLSearchParams(location.search).get("trees") === "classic") return null;
     try {
@@ -34,6 +50,84 @@ async function loadTreeModels() {
         console.warn("tree models failed, using the classic trees", e);
         return null;
     }
+}
+
+// The near trees' leaves: each branch card (a twig picture full of leaves) becomes two
+// smaller ones, one on the old stem and one further out along the twig and turned aside,
+// so the crown keeps its fullness and outline with leaves about two thirds the size.
+// Every card also learns its stem (aStem) and a phase of its own (aPhase), so the wind
+// shader can swing each card on its stem independently. The hanging filament curtains
+// (atlas cell 2) are left out: their fine strands shimmered into pixel noise.
+function leafCards(geo, seed) {
+    const rand = mulberry32(seed);
+    const P = geo.attributes.position, U = geo.attributes.uv, N = geo.attributes.normal, n = P.count;
+    if (!geo.index || !U) return geo;
+    const I = geo.index.array;
+    const par = new Int32Array(n);
+    for (let i = 0; i < n; i++) par[i] = i;
+    const find = (i) => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+    for (let t = 0; t < I.length; t += 3) { const a = find(I[t]); par[find(I[t + 1])] = a; par[find(I[t + 2])] = a; }
+    const cards = new Map();
+    for (let i = 0; i < n; i++) { const r = find(i); if (!cards.has(r)) cards.set(r, { v: [], t: [] }); cards.get(r).v.push(i); }
+    for (let t = 0; t < I.length; t += 3) cards.get(find(I[t])).t.push(I[t], I[t + 1], I[t + 2]);
+    const names = Object.keys(geo.attributes);
+    const out = Object.fromEntries(names.map((k) => [k, []]));
+    const stem = [], phase = [], idx = [];
+    const p = new THREE.Vector3(), q = new THREE.Vector3(), s = new THREE.Vector3(), d = new THREE.Vector3(), c = new THREE.Vector3();
+    const rot = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+    // copy a card with its vertices moved about the stem: scaled by sc, turned by rq, stem moved to ns
+    const emit = (card, st, sc, rq, ns) => {
+        const base = out.position.length / 3, map = new Map(), ph = rand();
+        card.v.forEach((i, j) => {
+            map.set(i, base + j);
+            for (const k of names) {
+                const A = geo.attributes[k];
+                if (k === "position") {
+                    p.fromBufferAttribute(A, i).sub(st).multiplyScalar(sc).applyQuaternion(rq).add(ns);
+                    out[k].push(p.x, p.y, p.z);
+                } else if (k === "normal") {
+                    p.fromBufferAttribute(A, i).applyQuaternion(rq);
+                    out[k].push(p.x, p.y, p.z);
+                } else for (let e = 0; e < A.itemSize; e++) out[k].push(A.getComponent(i, e));
+            }
+            stem.push(ns.x, ns.y, ns.z);
+            phase.push(ph);
+        });
+        for (const i of card.t) idx.push(map.get(i));
+    };
+    const none = new THREE.Quaternion();
+    for (const card of cards.values()) {
+        // the stem: the edge of the card nearest the middle of the atlas (the bottom of a
+        // twig cell, the top of a hanging curtain)
+        let best = 1, vs = 0;
+        for (const i of card.v) { best = Math.min(best, Math.abs(U.getY(i) - 0.5)); vs += U.getY(i); }
+        s.set(0, 0, 0); c.set(0, 0, 0);
+        let ns = 0;
+        for (const i of card.v) {
+            c.add(p.fromBufferAttribute(P, i));
+            if (Math.abs(U.getY(i) - 0.5) < best + 0.004) { s.add(p); ns++; }
+        }
+        s.multiplyScalar(1 / ns);
+        c.multiplyScalar(1 / card.v.length);
+        if (vs / card.v.length > 0.5) continue;   // a filament curtain: dropped
+        d.copy(c).sub(s);
+        const L = d.length() * 2;
+        emit(card, s, 0.6 + rand() * 0.12, none, s);
+        // the second card: further out along the twig, turned aside about the vertical
+        rot.setFromAxisAngle(Y, (rand() < 0.5 ? -1 : 1) * (0.5 + rand() * 0.8));
+        q.copy(s).addScaledVector(d.normalize(), L * (0.3 + rand() * 0.15));
+        emit(card, s, 0.58 + rand() * 0.12, rot, q.clone());
+    }
+    const g = new THREE.BufferGeometry();
+    for (const k of names) {
+        const A = geo.attributes[k];
+        g.setAttribute(k, new THREE.Float32BufferAttribute(out[k], A.itemSize));
+    }
+    g.setAttribute("aStem", new THREE.Float32BufferAttribute(stem, 3));
+    g.setAttribute("aPhase", new THREE.Float32BufferAttribute(phase, 1));
+    g.setIndex(idx);
+    g.computeBoundingSphere();
+    return g;
 }
 
 export async function buildIslands(scene, entities, onProgress) {
@@ -258,8 +352,20 @@ class Vegetation {
         this.glowMat = addWind(glowMaterial({ roughness: 0.8 }, "#ff9a5a"), 0.5, false);
         this.vineMat = addWind(glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff"), 1, false);
         if (kit) {
+            // the kit trees are about 100 m tall: their sway grows over their whole height
             this.leafMat = foliageMaterial(null, textures().alien, false, 1, true);
-            this.barkMat = addWind(glowMaterial({ roughness: 0.9, map: textures().bark }), 1, false);
+            this.leafMat.userData.windHeight = 100;
+            // the near trees: smaller leaf cards that each move on their own stem
+            let ls = 7;
+            for (const sp of ["canopy", "spire"]) for (const v of kit[sp]) { v.leaves = leafCards(v.leaves, 131 * ls++); dropCurtains(v.lo); }
+            this.leafHiMat = foliageMaterial(null, textures().alien, false, 1, true);
+            this.leafHiMat.userData.windHeight = 100;
+            this.leafHiMat.userData.cards = true;
+            // bark: the photo plus a normal map made from it (tools/make_bark_normal.py), so the
+            // plates and furrows catch the light
+            const bm = glowMaterial({ roughness: 0.9, map: textures().bark, normalMap: textures().barkN, normalScale: new THREE.Vector2(1.4, 1.4) });
+            bm.userData.windHeight = 100;
+            this.barkMat = addWind(bm, 1, false);
             // flowers that burst open on the near trees as the dragon passes (blossoms.js)
             addBlossoms(kit);
             this.blossomMat = blossomMaterial();
@@ -268,7 +374,7 @@ class Vegetation {
         this.hiRange = 600;      // set from the quality level
         this.groundRange = 300;  // ground cover (0: none)
         this.ground = kit ? new Ground(scene) : null;
-        this.CHUNK = 320;        // forest patch size for the near trees
+        this.CHUNK = 190;        // forest patch size for the near trees (small, so only close trees get full detail)
     }
 
     _instanced(geo, mat, list, colors = null) {
@@ -303,7 +409,7 @@ class Vegetation {
             const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length, c: ty < 2 ? leafTint(ty, trees[i], trees[i + 2], e.seed || 3, tintRand, this.kit ? key % 10 : -1) : null };
             list.push(tree);
             if (this.kit && ty < 2) {
-                const ck = Math.floor(trees[i] / this.CHUNK) + "," + Math.floor(trees[i + 2] / this.CHUNK);
+                const ck = Math.floor(trees[i] / this.CHUNK) + "," + Math.floor(trees[i + 1] / this.CHUNK) + "," + Math.floor(trees[i + 2] / this.CHUNK);
                 if (!chunks.has(ck)) chunks.set(ck, { trees: [], center: new THREE.Vector3(), hi: false, meshes: null, r: 0 });
                 const c = chunks.get(ck);
                 c.trees.push(tree);
@@ -354,7 +460,7 @@ class Vegetation {
         if (!this.kit) return;
         const m = new THREE.Matrix4().makeTranslation(0, -1e5, 0);
         for (const sp of ["canopy", "spire"]) for (const v of this.kit[sp]) {
-            for (const [geo, mat] of [[v.bark, this.barkMat], [v.leaves, this.leafMat], [v.blossom, this.blossomMat]]) this._instanced(geo, mat, [m]).visible = false;
+            for (const [geo, mat] of [[v.bark, this.barkMat], [v.leaves, this.leafHiMat], [v.blossom, this.blossomMat]]) this._instanced(geo, mat, [m]).visible = false;
         }
     }
 
@@ -366,7 +472,7 @@ class Vegetation {
             c.meshes = [];
             for (const [key, list] of byKey) {
                 const v = this.kit[Math.floor(key / 10) ? "spire" : "canopy"][key % 10];
-                c.meshes.push(this._instanced(v.bark, this.barkMat, list.map((t) => t.m)), this._instanced(v.leaves, this.leafMat, list.map((t) => t.m), list.map((t) => t.c)),
+                c.meshes.push(this._instanced(v.bark, this.barkMat, list.map((t) => t.m)), this._instanced(v.leaves, this.leafHiMat, list.map((t) => t.m), list.map((t) => t.c)),
                     this._instanced(v.blossom, this.blossomMat, list.map((t) => t.m)));
             }
         }
@@ -384,9 +490,18 @@ class Vegetation {
     // Hide forests on far islands (they're sub-pixel there anyway); trees near the camera
     // use the detailed Blender models; vines get a detailed version up close, a light one
     // at middle distance, and none beyond that.
-    update(cam, range) {
+    // Near-tree reach depends on where the patch is in view: well over twice as far straight
+    // ahead (plus how far the dragon flies in a second and a half), the plain range off to
+    // the side, and less behind the camera, where nothing is seen. So the swap to the detailed
+    // trees happens far out in front instead of just as the dragon arrives, for about the
+    // same number of detailed trees in all.
+    update(cam, range, camera = null) {
         const VINE_HI = 900, VINE_LO = Math.min(range, 4500);
         const HI = this.hiRange;
+        const fwd = _fwd.set(0, 0, 0);
+        if (camera) camera.getWorldDirection(fwd);
+        const ahead = Math.min(shared.uDragonVel.value.length(), 400) * 1.5;
+        const builds = [];
         this.ground?.update(cam, this.groundRange);
         this.rocks?.update(cam, range);
         for (const g of this.groups) {
@@ -396,15 +511,30 @@ class Vegetation {
             for (const m of g.vinesHi) m.visible = d < VINE_HI;
             for (const m of g.vinesLo) m.visible = d >= VINE_HI && d < VINE_LO;
             for (const c of g.chunks) {
-                const dc = c.center.distanceTo(cam) - c.r;
+                const dist = c.center.distanceTo(cam), dc = dist - c.r;
+                let lim = HI;
+                if (camera && dc > 0) {
+                    // angle off the view axis to the nearest edge of the patch
+                    const cosA = _to.subVectors(c.center, cam).dot(fwd) / dist;
+                    const a = Math.max(0, Math.acos(Math.min(1, Math.max(-1, cosA))) - Math.atan(c.r / dist));
+                    const ca = Math.cos(a);
+                    const front = THREE.MathUtils.smoothstep(ca, 0.35, 0.92);
+                    lim = ca >= 0.35 ? HI * (1 + 1.3 * front) + ahead * front : HI * Math.max(0.6, 1 + (ca - 0.35) * 0.5);
+                }
                 // a little hysteresis so a patch on the boundary doesn't flip every frame
-                const want = vis && (c.hi ? dc < HI * 1.15 : dc < HI);
-                if (want !== c.hi) this._setHi(g, c, want);
+                const want = vis && dc < lim * (c.hi ? 1.2 : 1);
+                if (want === c.hi) continue;
+                // patches never built yet are built a couple per frame, nearest first
+                if (want && !c.meshes) builds.push([dc, g, c]);
+                else this._setHi(g, c, want);
             }
         }
+        builds.sort((a, b) => a[0] - b[0]);
+        for (const [, g, c] of builds.slice(0, 2)) this._setHi(g, c, true);
     }
 }
 const ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
+const _fwd = new THREE.Vector3(), _to = new THREE.Vector3();
 
 // ---------------------------------------------------------------------------------
 // Ground cover: clumps of grass, ferns, flowers and low bushes on the grassy tops,

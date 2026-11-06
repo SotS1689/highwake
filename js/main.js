@@ -1,6 +1,7 @@
 // Title screen, HUD, menus, journal and map, settings, theme, install, analytics
 // and the support callout.
 
+import { GROUND_Y } from "./landgen.js";
 import * as THREE from "three";
 import { Game, ACHIEVEMENTS, KEY_NAMES } from "./game.js";
 import { WONDERS, GATES, BOUNDARY, buildWorld } from "./world.js";
@@ -105,8 +106,11 @@ const PX_PER_DEG = 4;
 const v3 = new THREE.Vector3();
 let hintShown = false;
 function drawHud(d) {
-    $("g-speed").textContent = Math.round(d.speed);
-    $("g-alt").textContent = Math.round(d.alt).toLocaleString();
+    // in feet: speed at half the flight model's (the raw numbers read too fast for the
+    // scale of the world), turned into ft/s; altitude over the real ground far below the
+    // cloud sea (GROUND_Y), so it never reads below zero, its number shown as feet
+    $("g-speed").textContent = Math.round(d.speed * 0.5 * 3.28084);
+    $("g-alt").textContent = Math.max(0, Math.round(d.alt - GROUND_Y)).toLocaleString();
     $("b-throttle").style.setProperty("--v", `${Math.round(d.throttle * 100)}%`);
     $("b-boost").style.setProperty("--v", `${Math.round(d.boost * 100)}%`);
     const deg = ((d.heading * 180) / Math.PI + 360) % 360;

@@ -46,8 +46,54 @@ function tubeGeo(pts, radii, sides, vScale = 40) {
     g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
     g.setIndex(idx);
+    // smooth normals, with the seam (where the texture wraps round) welded, so no
+    // crease runs down the wood
+    g.computeVertexNormals();
+    const Nm = g.attributes.normal, v = new THREE.Vector3(), w = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+        const a = i * (sides + 1), b = a + sides;
+        v.fromBufferAttribute(Nm, a).add(w.fromBufferAttribute(Nm, b)).normalize();
+        Nm.setXYZ(a, v.x, v.y, v.z); Nm.setXYZ(b, v.x, v.y, v.z);
+    }
     return g;
 }
+
+// A curved limb from p0 to p3 that sets off along t0 (a branch leaving its parent almost
+// along the parent's own grain) and bends smoothly round to its end: one cubic Bezier,
+// so its curvature changes gently all the way, with no kink anywhere. arch lifts the
+// middle; wob nudges it sideways. Evenly spaced samples.
+function bend(p0, t0, p3, n, arch = 0.1, wob = null, tanK = 0.38) {
+    const len = p0.distanceTo(p3);
+    const dir = p3.clone().sub(p0).normalize();
+    const p1 = p0.clone().addScaledVector(t0, len * tanK);
+    const p2 = p3.clone().addScaledVector(dir, -len * 0.32).add(new THREE.Vector3(0, len * arch, 0));
+    if (wob) p2.addScaledVector(wob, len * 0.08);
+    return new THREE.CubicBezierCurve3(p0, p1, p2, p3).getSpacedPoints(n - 1);
+}
+
+// A branch card (the leaves method of the tree kit, after CG Geek's video): a unit card for
+// a picture of a twig with many small leaves, its stem at the origin reaching along +y,
+// facing +z; cut to the twig's outline (narrow at the stem) and bent back along its length
+// and cupped across with loop cuts. uv v = 0 at the stem.
+const BRANCH_CARD = (() => {
+    const pos = [], uv = [], idx = [];
+    const W = [0.42, 0.95, 0.9];
+    [0, 0.5, 1].forEach((t, r) => {
+        for (const s of [-1, 0, 1]) {
+            pos.push(0.5 * s * W[r], t, -0.22 * t * t - 0.05 * W[r] * Math.abs(s));
+            uv.push(0.5 + 0.5 * s * W[r] * 0.98, t * 0.96);
+        }
+    });
+    for (let r = 0; r < 2; r++) for (let j = 0; j < 2; j++) {
+        const a = r * 3 + j, b = a + 3;
+        idx.push(a, a + 1, b + 1, a, b + 1, b);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    g.setIndex(idx);
+    return g;
+})();
 
 // a smooth path through control points (centripetal Catmull-Rom), n samples
 function smoothPath(ctrl, n) {
@@ -242,7 +288,19 @@ export class Landmarks {
             const p = pts[i];
             return r * (1 + 0.1 * Math.sin(a * 5 + t * 9) + 0.08 * noise.noise3(p.x * 0.02 + a, p.y * 0.02, p.z * 0.02));
         };
-        const addTube = (pts, radius, sides, color) => bark.push({ geo: tubeGeo(pts, radius, sides, 60), color, shade: barkShade, glow: veinGlow });
+        // collar: { a: parent axis point, d: parent direction, r: parent radius } bends this
+        // tube's normals into the parent's where it grows out of it, so the join is seamless
+        const addTube = (pts, radius, sides, color, collar = null) => bark.push({ geo: tubeGeo(pts, radius, sides, 60), color, shade: barkShade, glow: veinGlow, collar, keepNormals: true });
+        // the heading a branch sets off on: mostly along its parent's grain, turning toward
+        // where it is going, so it slips out of the parent in a long smooth curve
+        const setOff = (d, dir, k = 0.75) => d.clone().multiplyScalar(k).add(dir).add(new THREE.Vector3(0, 0.15, 0)).normalize();
+        // a radius function that swells into a collar at the start (hidden in the parent)
+        const collared = (pts, r0, r1, rp) => {
+            const base = ridged(pts, r0, r1);
+            const extra = Math.max(0, Math.min(rp * 0.9, r0 * 1.9) - r0);
+            const n = pts.length - 1;
+            return (i, j, a) => base(i, j, a) + extra * Math.pow(Math.max(0, 1 - i / Math.max(2, n * 0.3)), 2);
+        };
 
         // ---- the braid ----
         const stemTops = [];
@@ -260,14 +318,16 @@ export class Landmarks {
         capsule(V3(0, 0, 0), V3(0, H, 0), 185);
 
         // a leader rising from the heart of the braid to the topmost tier
-        const leader = smoothPath([[0, H * 0.6, 0], [25, H + 150, -12], [-35, H + 420, 30], [0, H + 600, 0]], 20);
-        addTube(leader, ridged(leader, 72, 22), 14, "#d6cebf");
+        const leader = smoothPath([[0, H * 0.6, 0], [25, H + 150, -12], [-35, H + 420, 30], [0, H + 600, 0], [8, H + 690, -4]], 56);
+        addTube(leader, ridged(leader, 72, 2), 20, "#d6cebf");
+        const leaderR = (i) => THREE.MathUtils.lerp(72, 2, Math.pow(i / (leader.length - 1), 0.8));
+        const dirAt = (pts, i) => pts[Math.min(pts.length - 1, i + 1)].clone().sub(pts[Math.max(0, i - 1)]).normalize();
         capsule(leader[0], leader[leader.length - 1], 50);
 
         // ---- limbs, forks and the tiers of foliage they carry ----
         const padAt = (c, R, tier) => pads.push({ c, R, tier });
-        const skel = [];    // limb points the crown's branches can grow from
-        for (const q of leader) if (q.y > H + 200) skel.push(q);
+        const skel = [];    // limb points the crown's branches can grow from: { p, r, d }
+        leader.forEach((q, i) => { if (q.y > H + 200 && leaderR(i) > 9) skel.push({ p: q, r: leaderR(i), d: dirAt(leader, i) }); });
         for (const st of stemTops) {
             const out = V3(Math.cos(st.a), 0, Math.sin(st.a));
             const side = V3(-out.z, 0, out.x);
@@ -279,7 +339,7 @@ export class Landmarks {
             ctrl.push(p0, p0.clone().addScaledVector(out, reach * 0.3).add(V3(0, lift * 0.9, 0)),
                 p0.clone().addScaledVector(out, reach * 0.65).add(V3(0, lift * 1.15, 0)).addScaledVector(side, (rand() - 0.5) * 120),
                 p0.clone().addScaledVector(out, reach).add(V3(0, lift * 0.85, 0)).addScaledVector(side, (rand() - 0.5) * 160));
-            const full = smoothPath(ctrl, 110);
+            const full = smoothPath(ctrl, 170);
             const acc = [0];
             for (let i = 1; i < full.length; i++) acc.push(acc[i - 1] + full[i].distanceTo(full[i - 1]));
             const total = acc[acc.length - 1];
@@ -292,12 +352,12 @@ export class Landmarks {
                     ? THREE.MathUtils.lerp(95, 58, Math.pow(sN / s0, 0.8)) + 50 * Math.pow(1 - sN / s0, 5)
                     : THREE.MathUtils.lerp(58, 2.5, Math.pow((sN - s0) / (1 - s0), 0.85));
                 return r * (1 + 0.1 * Math.sin(a * 5 + sN * 20) + 0.08 * noise.noise3(q.x * 0.02 + a, q.y * 0.02, q.z * 0.02));
-            }, 18, "#b8ab97");
+            }, 22, "#b8ab97");
             const lp = full.slice(iStart);
             const limb = Array.from({ length: 26 }, (_, k) => lp[Math.round((k * (lp.length - 1)) / 25)]);
             capsule(limb[0], limb[13], 48);
             capsule(limb[13], limb[25], 22);
-            skel.push(...limb.slice(7));
+            limb.forEach((q, k) => { const r = THREE.MathUtils.lerp(58, 2.5, Math.pow(k / 25, 0.85)); if (k >= 7 && r > 7) skel.push({ p: q, r, d: dirAt(limb, k) }); });
             padAt(limb[25].clone().add(V3(0, 50, 0)), 330 + rand() * 80, 0);
             padAt(limb[15].clone().add(V3(0, 110, 0)), 310 + rand() * 70, 1);
             padAt(limb[9].clone().add(V3(0, 150, 0)), 260 + rand() * 60, 2);
@@ -309,11 +369,11 @@ export class Landmarks {
                 // a fork peels away from the limb at a shallow angle, its base flared into a
                 // collar that starts inside the limb, so there is no seam where they meet
                 const along = limb[i0 + 1].clone().sub(limb[i0 - 1]).normalize();
-                const fork = smoothPath([limb[i0 - 2], q0.clone().addScaledVector(along, L * 0.08).addScaledVector(fd, L * 0.1).add(V3(0, 12, 0)),
-                    q0.clone().addScaledVector(fd, L * 0.5).add(V3(0, 90, 0)), q0.clone().addScaledVector(fd, L).add(V3(0, 60 + rand() * 80, 0))], 18);
-                addTube(fork, ridged(fork, 26, 1.5, 6), 12, "#bdb09c");
+                const f0 = limb[i0 - 1], fr = THREE.MathUtils.lerp(58, 2.5, Math.pow((i0 - 1) / 25, 0.85));
+                const fork = bend(f0, setOff(along, fd, 1.1), q0.clone().addScaledVector(fd, L).add(V3(0, 60 + rand() * 80, 0)), 40, 0.16);
+                addTube(fork, collared(fork, Math.min(26, fr * 0.62), 1.5, fr), 14, "#bdb09c", { a: f0, d: along, r: fr });
                 capsule(fork[0], fork[fork.length - 1], 16);
-                skel.push(...fork.slice(3));
+                fork.forEach((q, k) => { const r = THREE.MathUtils.lerp(26, 1.5, Math.pow(k / (fork.length - 1), 0.8)); if (k >= 8 && r > 6) skel.push({ p: q, r, d: dirAt(fork, k) }); });
                 padAt(fork[fork.length - 1].clone().add(V3(0, 55, 0)), 280 + rand() * 70, 2);
             }
         }
@@ -353,14 +413,16 @@ export class Landmarks {
             ctrl.push(V3(lip.x + ox * 70 + sway * 30, lip.y - drop * 0.35, lip.z + oz * 70 - sway * 20));
             ctrl.push(V3(lip.x + ox * 60 + sway * 70, lip.y - drop * 0.7, lip.z + oz * 60 + sway * 40));
             ctrl.push(V3(lip.x + ox * 45 + sway * 50, lip.y - drop, lip.z + oz * 45 + sway * 70));
-            const root = smoothPath(ctrl, main ? 48 : 36);
-            addTube(root, ridged(root, main ? 48 : 26, 3), main ? 12 : 8, "#7a6a58");
+            const root = smoothPath(ctrl, main ? 72 : 54);
+            addTube(root, ridged(root, main ? 48 : 26, 0.6, main ? 30 : 16), main ? 16 : 11, "#7a6a58");
             // a few thin rootlets trailing from the hanging part
             for (let k = 0; k < (main ? 3 : 1); k++) {
                 const q = root[Math.floor(root.length * (0.55 + rand() * 0.3))];
                 const L = 120 + rand() * 260;
-                const rl = smoothPath([q, q.clone().add(V3((rand() - 0.5) * 60, -L * 0.5, (rand() - 0.5) * 60)), q.clone().add(V3((rand() - 0.5) * 90, -L, (rand() - 0.5) * 90))], 10);
-                addTube(rl, ridged(rl, 7, 1.5), 5, "#7a6a58");
+                const rd = dirAt(root, root.indexOf(q));
+                const rl = bend(q, setOff(rd, V3(0, -1, 0), 1.0), q.clone().add(V3((rand() - 0.5) * 90, -L, (rand() - 0.5) * 90)), 22, 0.0, V3(rand() - 0.5, 0, rand() - 0.5));
+                const rr0 = 7, rootR = THREE.MathUtils.lerp(main ? 48 : 26, 0.6, Math.pow(root.indexOf(q) / (root.length - 1), 0.8));
+                addTube(rl, collared(rl, rr0, 0.3, rootR), 8, "#7a6a58", { a: q, d: rd, r: rootR });
             }
         }
 
@@ -377,24 +439,29 @@ export class Landmarks {
             const { c, R } = pd;
             const thick = R * 0.16;      // shelves: wide and flat-topped, not round puffs
             this.colliders.push({ t: "s", c: toWorld(c), r: R * 0.3 });
-            const near = skel.filter((q) => q.distanceTo(c) < R * 1.2);
-            if (!near.length) near.push(skel.reduce((b, q) => (q.distanceTo(c) < b.distanceTo(c) ? q : b), skel[0]));
+            const near = skel.filter((q) => q.p.distanceTo(c) < R * 1.2);
+            if (!near.length) near.push(skel.reduce((b, q) => (q.p.distanceTo(c) < b.p.distanceTo(c) ? q : b), skel[0]));
             const nb = Math.round(R / 13);
+            const hold = [];     // points on this shelf's wood that things can hang from: { p, r }
             for (let k = 0; k < nb; k++) {
-                const start = near[Math.floor(rand() * near.length)];
+                const st = near[Math.floor(rand() * near.length)], start = st.p;
                 const a = rand() * Math.PI * 2, rr = Math.sqrt(0.15 + 0.85 * rand()) * R * 0.95;
                 const end = V3(c.x + Math.cos(a) * rr, c.y + (rand() - 0.25) * thick * 1.2, c.z + Math.sin(a) * rr);
                 const len = start.distanceTo(end);
-                const m1 = start.clone().lerp(end, 0.33).add(V3(0, len * 0.1, 0)).addScaledVector(rq(), len * 0.1);
-                const m2 = start.clone().lerp(end, 0.7).add(V3(0, len * 0.08, 0)).addScaledVector(rq(), len * 0.08);
-                const br = smoothPath([start, m1, m2, end], 9);
-                addTube(br, ridged(br, Math.min(11, 3 + len * 0.025), 1.0, 3), 5, "#cdc1ad");
-                // leaf clumps along the outer part of the branch
+                const dir = end.clone().sub(start).normalize();
+                // a branch starts on its parent's axis, slips out along the parent's grain in
+                // one long smooth curve and is never thicker than about two thirds of what it
+                // grows from
+                const br = bend(start, setOff(st.d, dir), end, 22, 0.08 + rand() * 0.06, rq());
+                const r0 = Math.min(11, 3 + len * 0.025, st.r * 0.62);
+                addTube(br, collared(br, r0, 1.0, st.r), 8, "#cdc1ad", { a: start, d: st.d, r: st.r });
+                br.forEach((q, i) => { if (i >= 7) hold.push({ p: q, r: THREE.MathUtils.lerp(r0, 1.0, Math.pow(i / (br.length - 1), 0.8)) }); });
+                // leaf clumps along the outer part of the branch, wrapped round it
                 const nClumps = Math.max(3, Math.round(len * 0.65 / 19));
                 for (let j = 0; j < nClumps; j++) {
                     const t = 0.35 + 0.65 * (j + rand() * 0.6) / nClumps;
                     const i = Math.min(br.length - 1, Math.round(t * (br.length - 1)));
-                    const q = br[i].clone().addScaledVector(rq().multiply(V3(1, 0.35, 1)), 34);
+                    const q = br[i].clone();
                     const h = THREE.MathUtils.clamp((q.y - (c.y - thick)) / (2 * thick), 0, 1);
                     tmpC.copy(bot0).lerp(top0, Math.pow(h, 0.8));
                     tmpC.multiplyScalar(0.88 + rand() * 0.24);
@@ -402,14 +469,21 @@ export class Landmarks {
                     const hex = "#" + tmpC.getHexString();
                     const glow = (1 - h) * 0.4 + (rand() < 0.05 ? 0.45 : 0);
                     const out = q.clone().sub(c).divideScalar(R).add(V3(0, 1.3, 0));
-                    for (let n = 0; n < 4 + (rand() < 0.5 ? 1 : 0); n++) {
-                        const nrm = rq().addScaledVector(out, 0.9).normalize();
-                        const qq = new THREE.Quaternion().setFromUnitVectors(V3(0, 0, 1), nrm);
-                        qq.multiply(new THREE.Quaternion().setFromAxisAngle(V3(0, 0, 1), rand() * 6.28));
-                        const sz = 42 + rand() * 30;
+                    // branch cards (a twig of many small leaves): stem on the branch, reaching
+                    // out at a random heading and tilt, facing broadly up and out
+                    // (smaller cards, twice as many: finer leaves, each with its own stem and
+                    // rhythm so it moves on its own in the wind and the dragon's air)
+                    for (let n = 0; n < 9 + (rand() < 0.5 ? 1 : 0); n++) {
+                        const face = rq().multiplyScalar(0.5).addScaledVector(out.clone().normalize(), 1).normalize();
+                        const reach = rq().multiply(V3(1, 0.5, 1)).addScaledVector(out.clone().setY(0).normalize(), 0.7).normalize();
+                        const right = reach.clone().cross(face).normalize();
+                        const nf = right.clone().cross(reach).normalize();
+                        const sz = 20 + rand() * 14;
+                        const at = q.clone().addScaledVector(rq(), 3);
                         leaves.push({
-                            geo: new THREE.PlaneGeometry(sz, sz), uvRect: ALIEN_FAN, normalFrom: [c.x, c.y - thick * 1.6, c.z],
-                            matrix: new THREE.Matrix4().compose(q.clone().addScaledVector(rq(), 8), qq, V3(1, 1, 1)), color: hex, glow,
+                            geo: BRANCH_CARD, uvRect: ALIEN_FAN, normalFrom: [c.x, c.y - thick * 1.6, c.z],
+                            matrix: new THREE.Matrix4().makeBasis(right, reach, nf).scale(V3(sz, sz, sz)).setPosition(at), color: hex, glow,
+                            stem: [at.x, at.y, at.z], phase: rand(),
                         });
                     }
                 }
@@ -417,9 +491,14 @@ export class Landmarks {
             // the curtains: beaded filaments falling from the rim of the shelf, longest on
             // the outermost shelves (tier 0), so the crown trails veils into the sky
             const nFr = Math.round(R * 0.04);
+            const rimWood = hold.filter((h) => Math.hypot(h.p.x - c.x, h.p.z - c.z) > R * 0.55);
+            const pool = rimWood.length ? rimWood : hold;
+            // the wood point nearest a wanted spot round the shelf, so curtains stay spread out
+            const woodNear = (x, z) => pool.reduce((b, h) => (Math.hypot(h.p.x - x, h.p.z - z) < Math.hypot(b.p.x - x, b.p.z - z) ? h : b), pool[0]);
+            const hangFrom = (h) => h.p.clone().add(V3(0, -h.r * 0.7, 0));
             for (let k = 0; k < nFr; k++) {
                 const a = (k / nFr) * Math.PI * 2 + rand() * 0.2, rr = R * (0.72 + rand() * 0.26);
-                const p = V3(c.x + Math.cos(a) * rr, c.y - thick * 0.35, c.z + Math.sin(a) * rr);
+                const p = hangFrom(woodNear(c.x + Math.cos(a) * rr, c.z + Math.sin(a) * rr));
                 const len = (pd.tier === 0 ? 160 : 90) + rand() * (pd.tier === 0 ? 300 : 160);
                 const q = new THREE.Quaternion().setFromAxisAngle(V3(0, 1, 0), -a + Math.PI / 2 + (rand() - 0.5) * 0.6);
                 const tint = tmpC.set(rand() < 0.3 ? "#f3d6ff" : rand() < 0.5 ? "#d4f6ff" : "#e8fff6");
@@ -427,36 +506,51 @@ export class Landmarks {
                     geo: new THREE.PlaneGeometry(len * 0.3, len, 1, 4).translate(0, -len / 2, 0), uvRect: ALIEN_FILAMENT,
                     normalFrom: [c.x, c.y + thick, c.z], matrix: new THREE.Matrix4().compose(p, q, V3(1, 1, 1)),
                     color: "#" + tint.getHexString(), glow: (x, y) => 0.15 + THREE.MathUtils.clamp((p.y - y) / len, 0, 1) * 0.85,
+                    stem: [p.x, p.y, p.z], phase: rand(),
                 });
             }
             // lantern-fruit and glowing tendrils under the tier
+            // (each entry is the point on the wood its thread hangs from)
             for (let k = 0; k < Math.round(R / 22); k++) {
-                const a = rand() * Math.PI * 2, rr = Math.sqrt(rand()) * R * 0.75;
-                fruit.push([c.x + Math.cos(a) * rr, c.y - thick * 0.6 - 10 - rand() * 50, c.z + Math.sin(a) * rr, 2.5 + rand() * 3]);
+                const h = hold[Math.floor(rand() * hold.length)];
+                const p = hangFrom(h);
+                fruit.push([p.x, p.y, p.z, 2.5 + rand() * 3]);
             }
             // the veils: a thousand-odd glowing strands, thickest round the rim of each shelf,
             // longest under the outer shelves, so the whole crown trails curtains into the sky
             for (let k = 0; k < Math.round(R / 9); k++) {
                 const a = rand() * Math.PI * 2, rr = Math.pow(rand(), 0.35) * R * 0.95;
                 const L = ((pd.tier === 0 ? 260 : pd.tier === 1 ? 170 : 110) + rand() * (pd.tier === 0 ? 720 : 420)) * (0.3 + 0.7 * rr / R);
-                this.tendrilSpots.push([c.x + Math.cos(a) * rr, c.y - thick * 0.45, c.z + Math.sin(a) * rr, L]);
+                const p = hangFrom(rr > R * 0.55 ? woodNear(c.x + Math.cos(a) * rr, c.z + Math.sin(a) * rr) : hold[Math.floor(rand() * hold.length)]);
+                this.tendrilSpots.push([p.x, p.y + 0.5, p.z, L]);
             }
         }
 
         // seed-hearts: great glowing teardrops clustered round the top of the leader
-        const crest = leader[leader.length - 1];
+        // each on its own stalk that grows out of the leader and arches over, the heart
+        // hanging from the stalk's tip
+        const hearts = [];
         for (let k = 0; k < 9; k++) {
-            const a = (k / 9) * Math.PI * 2 + rand() * 0.4, rr = 30 + rand() * 45;
-            fruit.push([crest.x + Math.cos(a) * rr, crest.y + 10 + rand() * 60, crest.z + Math.sin(a) * rr, 9 + rand() * 9]);
+            const a = (k / 9) * Math.PI * 2 + rand() * 0.4, rr = 40 + rand() * 50;
+            const i0 = leader.length - 4 - Math.floor(rand() * 4);
+            const s0 = leader[i0], sr = leaderR(i0), sd = dirAt(leader, i0);
+            const out = V3(Math.cos(a), 0, Math.sin(a));
+            const up = 40 + rand() * 50;
+            const tip = s0.clone().addScaledVector(out, rr).add(V3(0, up - 10, 0));
+            const stalk = bend(s0, setOff(sd, out.clone().add(V3(0, 0.6, 0)).normalize(), 1.0), tip, 26, 0.35);
+            addTube(stalk, collared(stalk, Math.min(7, sr * 0.6), 1.6, sr), 10, "#d6cebf", { a: s0, d: sd, r: sr });
+            hearts.push([tip.x, tip.y - 1.2, tip.z, 9 + rand() * 9]);
         }
         const tree = new THREE.Mesh(buildParts(bark), glowMaterial({ roughness: 0.85 }, "#7fe8ff", false, "bark"));
         tree.position.copy(base);
         this.scene.add(tree);
-        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#8ff3ff", textures().alien, 1.45, 0.3, true));
+        const crownMat = foliageMaterial("#8ff3ff", textures().alien, 1.45, 0.12, true);
+        crownMat.userData.cards = true;   // every leaf card swings on its own stem (gfx.js addWind)
+        const crown = new THREE.Mesh(buildParts(leaves), crownMat);
         crown.position.copy(base);
         this.scene.add(crown);
         // glowing tendrils (the reason to come back at night)
-        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.15, 1, 4, 5).translate(0, -0.5, 0), color: "#cdd2ff", glow: (x, y) => 0.25 - y * 0.75 }]);
+        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.15, 1, 8, 5).translate(0, -0.5, 0), color: "#cdd2ff", glow: (x, y) => 0.25 - y * 0.75 }]);
         const im = new THREE.InstancedMesh(tg, glowMaterial({ roughness: 0.8 }, "#c39bff"), this.tendrilSpots.length);
         const m4 = new THREE.Matrix4();
         this.tendrilSpots.forEach((t, i) => im.setMatrixAt(i, m4.compose(V3(t[0], t[1], t[2]), new THREE.Quaternion(), V3(1.4 + (i % 3) * 0.5, t[3], 1.4 + (i % 3) * 0.5))));
@@ -464,15 +558,19 @@ export class Landmarks {
         im.computeBoundingSphere();
         this.scene.add(im);
         // lantern-fruit: teardrops on a thread
-        const fg = buildParts([
-            { geo: new THREE.SphereGeometry(1, 10, 8), matrix: M4([0, -1.2, 0], [0, 0, 0], [1, 1.4, 1]), color: "#ffe9b8", glow: 1.2 },
-            { geo: new THREE.CylinderGeometry(0.05, 0.05, 6, 3).translate(0, 3, 0), color: "#6a8f9a", glow: 0.1 },
+        // (the instance origin is the top of the thread, where it is tied to the wood)
+        const drop = (thread) => buildParts([
+            { geo: new THREE.SphereGeometry(1, 10, 8), matrix: M4([0, -thread - 1.3, 0], [0, 0, 0], [1, 1.4, 1]), color: "#ffe9b8", glow: 1.2 },
+            { geo: new THREE.CylinderGeometry(0.06, 0.06, thread + 0.2, 6).translate(0, -thread / 2, 0), color: "#6a8f9a", glow: 0.1 },
         ]);
-        const fm = new THREE.InstancedMesh(fg, glowMaterial({ roughness: 0.4 }, "#ffd89a"), fruit.length);
-        fruit.forEach((f, i) => fm.setMatrixAt(i, m4.compose(V3(f[0], f[1], f[2]), new THREE.Quaternion(), V3(f[3], f[3], f[3]))));
-        fm.position.copy(base);
-        fm.computeBoundingSphere();
-        this.scene.add(fm);
+        const fruitMat = glowMaterial({ roughness: 0.4 }, "#ffd89a");
+        for (const [list, geo] of [[fruit, drop(6)], [hearts, drop(0.8)]]) {
+            const fm = new THREE.InstancedMesh(geo, fruitMat, list.length);
+            list.forEach((f, i) => fm.setMatrixAt(i, m4.compose(V3(f[0], f[1], f[2]), new THREE.Quaternion(), V3(f[3], f[3], f[3]))));
+            fm.position.copy(base);
+            fm.computeBoundingSphere();
+            this.scene.add(fm);
+        }
         this.treeTop = base.clone().add(V3(0, H + 380, 0));
     }
 
