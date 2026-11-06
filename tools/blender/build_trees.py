@@ -2,7 +2,10 @@
 #   tex/leaves.png      a 2x2 atlas of leaf clusters rendered from modelled leaves
 #                       (0 broadleaf, 1 conifer spray, 2 weeping frond, 3 bark patch)
 #   tex/undergrowth.png a 2x2 atlas for ground cover (0 grass tuft, 1 fern, 2 flowers, 3 bush)
-#   models/trees.glb    two species x two variants, each as
+#   tex/alien.png       the otherworldly atlas (fan, plume, filament curtain, bark patch)
+#   models/trees.glb    the otherworldly suite (see SPECIES below: Parasol, Veilwillow,
+#                       Cloudpad as canopy1-3; Corkscrew, Lantern fir, Bellcap as spire1-3), each as
+#   (leaves.png and undergrowth.png are only rebuilt with --all-atlases)
 #                       <name>_bark   (near: bark tubes, tiling bark texture)
 #                       <name>_leaves (near: leaf-cluster cards on the leaves atlas)
 #                       <name>_lo     (far: a few cards + a stub trunk, all on the atlas)
@@ -267,9 +270,9 @@ def cluster_bush(m, rnd, c):
             leaf(m, o + d * (L * t), Vector((math.cos(la), math.sin(la), 0)), sz, sz * 0.5, jitter_col(rnd, rnd.choice(greens)))
 
 
-def fit_cell(m, start, c, margin=0.03):
+def fit_cell(m, start, c, margin=0.03, origin=None):
     """Scale the verts added since start about the cell's attach point so they fit the cell."""
-    o = cell_origin(c)
+    o = origin if origin is not None else cell_origin(c)
     cx, cy = c % 2, c // 2
     x0, x1, y0, y1 = cx - 1 + margin, cx - margin, -cy + margin * 0.5, 1 - cy - margin
     k = 1.0
@@ -290,8 +293,8 @@ def build_atlas(fns, name, bark=False, seed=7):
     m = RMesh()
     for c, fn in enumerate(fns):
         n0 = len(m.v)
-        fn(m, rnd, c)
-        fit_cell(m, n0, c)
+        o = fn(m, rnd, c)   # a cluster may return its own attach point (hanging ones: top edge)
+        fit_cell(m, n0, c, origin=o if isinstance(o, Vector) else None)
     me = bpy.data.meshes.new("leafatlas")
     me.from_pydata([tuple(v) for v in m.v], [], m.f)
     ca = me.color_attributes.new("Col", "FLOAT_COLOR", "POINT")
@@ -422,8 +425,9 @@ def frames_along(pts):
     return T, N
 
 
-def tube(m, pts, radii, sides, col=(1, 1, 1), tile=3.2, cell=None, shade=None):
-    """Bark tube. cell=None: tiling bark uv; cell=3: inside the atlas bark patch."""
+def tube(m, pts, radii, sides, col=(1, 1, 1), tile=3.2, cell=None, shade=None, glow=None):
+    """Bark tube. cell=None: tiling bark uv; cell=3: inside the atlas bark patch.
+    glow: optional f(point, angle, distance along) -> night-glow mask for each vertex."""
     T, N = frames_along(pts)
     circ = TAU * max(radii[0], 0.2)
     urep = max(1, round(circ / tile)) if cell is None else 1
@@ -441,7 +445,8 @@ def tube(m, pts, radii, sides, col=(1, 1, 1), tile=3.2, cell=None, shade=None):
             else:
                 uv = uv_in_cell(cell, u, (acc / max(1.0, sum((pts[k] - pts[k - 1]).length for k in range(1, len(pts))))))
             c = col if shade is None else shade(p, col)
-            ring.append(m.vert(p + d * radii[i], d, uv, c))
+            q = p + d * radii[i]
+            ring.append(m.vert(q, d, uv, c, glow(q, a, acc) if glow else 0.0))
         rings.append(ring)
     for a, b in zip(rings, rings[1:]):
         for j in range(sides):
@@ -681,6 +686,521 @@ def spire(seed):
     return [bark, leaves, lo]
 
 
+# =================================================================================
+# The otherworldly suite: tex/alien.png + six species (models/trees.glb)
+#   alien atlas cells: 0 sword-leaf fan (dragon-blood rosette, jade to moon-silver)
+#                      1 plume (feathered frond, indigo through cyan to rose)
+#                      2 filament curtain (glowing strands and beads, hanging from the TOP edge)
+#                      3 bark patch (for the far versions' trunks)
+#   canopy1 Parasol     dragon-blood umbrella: forking limbs, a dense flat crown, a fringe of glowing filaments
+#   canopy2 Veilwillow  arching limbs hung with luminous curtains almost to the ground
+#   canopy3 Cloudpad    a twisted two-stem trunk holding floating bonsai pads, lanterns underneath
+#   spire1  Corkscrew   a spiralling trunk wound with a staircase of plumes, a glowing bud on top
+#   spire2  Lantern fir tiers of drooping plume-limbs, glowing seed-lanterns at the tips
+#   spire3  Bellcap     a slender stalk carrying three jellyfish bells trailing filaments
+# =================================================================================
+
+def leafg(m, base, d, length, width, c0, c1, n=6, shape=0.8, cup=0.006, curve=0.0):
+    """A blade whose colour runs from c0 at its base to c1 at its tip; curve bends it sideways."""
+    d = Vector((d.x, d.y, 0)).normalized()
+    rows, c, dd = [], base.copy(), d.copy()
+    for i in range(n + 1):
+        t = i / n
+        if i:
+            dd = (dd + Vector((-dd.y, dd.x, 0)) * (curve / n)).normalized()
+            c = c + dd * (length / n)
+        w = width * math.sin(math.pi * min(1.0, max(t, 1e-3) ** shape)) * (1 - 0.15 * t)
+        col = tuple(c0[k] + (c1[k] - c0[k]) * t for k in range(3))
+        sd = Vector((-dd.y, dd.x, 0))
+        if i == n:
+            rows.append([m.vert(c, col)])
+            continue
+        row = []
+        for k in (-1.0, 0.0, 1.0):
+            rib = 1.15 if k == 0.0 else 0.85
+            z = cup * (1 - k * k) * math.sin(math.pi * t)
+            row.append(m.vert(c + sd * (w * k) + Vector((0, 0, z)), tuple(x * rib for x in col)))
+        rows.append(row)
+    for ra, rb in zip(rows, rows[1:]):
+        if len(rb) == 1:
+            for j in range(len(ra) - 1):
+                m.f.append([ra[j], ra[j + 1], rb[0]])
+        else:
+            for j in range(len(ra) - 1):
+                m.f.append([ra[j], ra[j + 1], rb[j + 1], rb[j]])
+
+
+def lerp3(a, b, t):
+    return tuple(a[k] + (b[k] - a[k]) * t for k in range(3))
+
+
+def cluster_fan(m, rnd, c=0):
+    o = cell_origin(c)
+    bases = [(0.015, 0.06, 0.06), (0.02, 0.07, 0.08), (0.02, 0.05, 0.09)]
+    tips = [(0.3, 0.5, 0.42), (0.38, 0.5, 0.47), (0.44, 0.4, 0.55), (0.27, 0.45, 0.5), (0.5, 0.52, 0.48)]
+    for layer in range(3):
+        n = 26 - layer * 6
+        for k in range(n):
+            f = (k + rnd.random() * 0.7) / n
+            a = math.radians(14 + 152 * f)
+            L = (0.84 - layer * 0.16) * (0.72 + 0.28 * math.sin(math.pi * f)) * rnd.uniform(0.86, 1.05)
+            d = Vector((math.cos(a), math.sin(a), 0))
+            leafg(m, o + d * 0.025 + Vector((0, 0, 0.012 * layer)), d, L, L * 0.075,
+                  rnd.choice(bases), jitter_col(rnd, rnd.choice(tips), 0.12), n=8, shape=0.5, curve=rnd.uniform(-0.3, 0.3))
+
+
+def cluster_plume(m, rnd, c=1):
+    o = cell_origin(c)
+    for k in range(5):
+        a = math.radians(90 + (k - 2) * 23 + rnd.uniform(-4, 4))
+        L = 0.88 - abs(k - 2) * 0.1
+        bend = (2 - k) * 0.11 + rnd.uniform(-0.05, 0.05)
+        pts, p, d = [], o.copy(), Vector((math.cos(a), math.sin(a), 0))
+        for i in range(14):
+            pts.append(p.copy())
+            d = (d + Vector((-d.y, d.x, 0)) * bend / 13).normalized()
+            p = p + d * (L / 13)
+        twig(m, pts, 0.005, (0.1, 0.06, 0.22))
+        for i in range(1, 13):
+            t = i / 13
+            dseg = (pts[i + 1] - pts[i - 1]).normalized()
+            side = Vector((-dseg.y, dseg.x, 0))
+            bl = 0.15 * math.sin(math.pi * min(1.0, t * 1.08)) + 0.025
+            c1 = lerp3((0.12, 0.5, 0.68), (0.85, 0.42, 0.7), t ** 1.4)
+            for sgn in (-1, 1):
+                leafg(m, pts[i], (side * sgn + dseg * 0.6).normalized(), bl, 0.008, (0.06, 0.04, 0.2),
+                      jitter_col(rnd, tuple(x * 0.65 for x in c1), 0.1), n=4, shape=0.5, curve=-sgn * 0.4)
+
+
+def cluster_filaments(m, rnd, c=2):
+    """Strands falling from the top centre of the cell, beaded, brightening toward the tips."""
+    cx, cy = c % 2, c // 2
+    top = Vector((cx - 0.5, 1 - cy - 0.08, 0))
+    for k in range(5):   # a little tuft hiding where the strands hang from
+        a = math.radians(200 + k * 35)
+        leafg(m, top, Vector((math.cos(a), math.sin(a), 0)), 0.09, 0.012, (0.03, 0.1, 0.12), (0.2, 0.45, 0.45), n=4)
+    for k in range(19):
+        x0 = (k - 9) / 9 * 0.42 + rnd.uniform(-0.015, 0.015)
+        L = rnd.uniform(0.7, 0.9) * (1 - 0.2 * abs(x0) / 0.42)
+        ph, amp = rnd.uniform(0, TAU), rnd.uniform(0.01, 0.03)
+        pts = []
+        for i in range(22):
+            t = i / 21
+            pts.append(top + Vector((x0 * (0.15 + 0.85 * t ** 0.7) + amp * math.sin(t * 7 + ph) * t, -L * t, 0.002 * k)))
+        for i in range(21):
+            t = i / 21
+            a, b = pts[i], pts[i + 1]
+            dd = (b - a).normalized()
+            s = Vector((-dd.y, dd.x, 0)) * (0.0028 * (1 - 0.5 * t))
+            ca = lerp3((0.1, 0.22, 0.3), (0.42, 0.55, 0.68), t)
+            cb = lerp3((0.1, 0.22, 0.3), (0.42, 0.55, 0.68), (i + 1) / 21)
+            m.f.append([m.vert(a - s, ca), m.vert(a + s, ca), m.vert(b + s, cb), m.vert(b - s, cb)])
+        tint = rnd.choice([(0.6, 0.7, 0.8), (0.7, 0.55, 0.8), (0.5, 0.75, 0.68)])
+        for i in list(range(5, 21, rnd.randint(3, 5))) + [21]:
+            r = 0.013 if i == 21 else 0.007
+            p = pts[i] + Vector((0, 0, 0.003))
+            q = [m.vert(p + Vector((0, r * 1.4, 0)), tint), m.vert(p + Vector((r, 0, 0)), tint),
+                 m.vert(p + Vector((0, -r * 1.4, 0)), tint), m.vert(p + Vector((-r, 0, 0)), tint)]
+            m.f.append(q)
+    return top
+
+
+def hang(m, attach, L, w, face, cell, crown, ao, glow=1.0, sway=0.0):
+    """A card hanging straight down from attach (filament curtains): four rows so the wind
+    can bend it, the texture's top edge at the attach point, glowing more toward the tip."""
+    face = Vector((face.x, 0, face.z))
+    face = face.normalized() if face.length > 1e-3 else Vector((1, 0, 0))
+    right = UP.cross(face).normalized()
+    rows = []
+    for t in (0.0, 0.33, 0.66, 1.0):
+        c = attach - UP * (L * t) + face * (sway * L * t * t)
+        row = []
+        for s in (-1, 1):
+            p = c + right * (w * 0.5 * s * (1.0 + 0.3 * t))
+            radial = (p - crown).normalized() if (p - crown).length > 1e-3 else face
+            n = (face * 0.45 + radial * 0.55).normalized()
+            row.append(m.vert(p, n, uv_in_cell(cell, 0.5 + 0.49 * s, 0.995 - 0.99 * t), ao(p), glow * (0.08 + 0.62 * t ** 1.5)))
+        rows.append(row)
+    for a, b in zip(rows, rows[1:]):
+        m.f.append([a[0], a[1], b[1], b[0]])
+
+
+def octa(m, c, r, col, glow, stretch=1.4):
+    """A small glowing seed-lantern (bark mesh; uv in a flat corner of the bark texture)."""
+    ax = [Vector((r, 0, 0)), Vector((-r, 0, 0)), Vector((0, r * stretch, 0)), Vector((0, -r * stretch, 0)), Vector((0, 0, r)), Vector((0, 0, -r))]
+    idx = [m.vert(c + v, v, (0.02, 0.02), col, glow) for v in ax]
+    for a, b, cc in ((0, 2, 4), (4, 2, 1), (1, 2, 5), (5, 2, 0), (4, 3, 0), (1, 3, 4), (5, 3, 1), (0, 3, 5)):
+        m.f.append([idx[a], idx[b], idx[cc]])
+
+
+def lantern(bark, rnd, p, drop, r, col=(1.0, 0.95, 0.85)):
+    q = p - UP * drop
+    tube(bark, [p, p.lerp(q, 0.5) + rand_unit(rnd) * 0.15, q], [0.06, 0.05, 0.04], 3, (0.5, 0.5, 0.55))
+    octa(bark, q - UP * r * 1.2, r, col, 1.0)
+
+
+def roots_ring(bark, rnd, col, n, r0, L0, L1, y0=3.0, glow=None):
+    for k in range(n):
+        a = TAU * k / n + rnd.uniform(-0.25, 0.25)
+        o = Vector((math.cos(a), 0, math.sin(a)))
+        L = rnd.uniform(L0, L1)
+        pts = smooth_path([Vector((0, y0, 0)) + o * r0 * 0.5, Vector((0, y0 * 0.4, 0)) + o * (L * 0.38),
+                           Vector((0, -0.2, 0)) + o * (L * 0.72), Vector((0, -1.0, 0)) + o * L], 5)
+        tube(bark, pts, [r0 * 0.5, r0 * 0.4, r0 * 0.28, r0 * 0.15, 0.08], 5, col, glow=glow)
+
+
+def spiral_glow(freq, turns, width=0.92, amp=0.7, fade=None):
+    """Glowing veins winding up a trunk: a mask from the vertex's angle and height."""
+    def f(q, a, s):
+        v = math.sin(a * turns + q.y * freq)
+        g = amp * clamp((v - width) / (1 - width))
+        return g * (fade(q) if fade else 1.0)
+    return f
+
+
+def V(x, y, z):
+    return Vector((x, y, z))
+
+
+def parasol(idx, seed):
+    rnd = random.Random(seed)
+    nm = "canopy%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    col = (0.96, 0.9, 0.82)
+    H = 23.0
+    sway = V(rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1)) * 1.4
+    trunk = smooth_path([V(0, -3, 0), V(0, 6, 0) + sway * 0.4, V(0, 15, 0) - sway * 0.3, V(0, H, 0) + sway * 0.2], 10)
+    tr = [3.1 * (1 - 0.3 * (i / 9)) + 1.8 * max(0.0, 1 - i / 2.2) ** 2 for i in range(10)]
+    vg = spiral_glow(0.35, 3, 0.9, 0.55, fade=lambda q: clamp(1 - q.y / 30))
+    tube(bark, trunk, tr, 12, col, glow=vg)
+    roots_ring(bark, rnd, col, 8, 2.6, 6, 10, glow=vg)
+    tips = []
+
+    def fork(p, d, L, r, depth):
+        pts = grow(p, d, L, 3, rnd, up_pull=0.0, wobble=0.05)
+        radii = [r * (1 - 0.3 * i / 3) for i in range(4)]
+        tube(bark, pts, radii, (8, 6, 4, 3)[depth], col, glow=vg if depth < 2 else None)
+        if depth == 3:
+            tips.append((pts[-1], d))
+            return
+        side = d.cross(UP)
+        side = side.normalized() if side.length > 1e-3 else V(1, 0, 0)
+        side = (side * math.cos(rnd.uniform(-0.6, 0.6)) + d.cross(side).normalized() * math.sin(rnd.uniform(-0.6, 0.6))).normalized()
+        out = V(d.x, 0, d.z)
+        out = out.normalized() if out.length > 1e-3 else side
+        for s in (-1, 1):
+            a = math.radians(rnd.uniform(24, 34))
+            nd = (d * math.cos(a) + side * s * math.sin(a) + out * 0.12 * depth).normalized()
+            fork(pts[-1], nd, L * rnd.uniform(0.68, 0.76), radii[-1] * 0.8, depth + 1)
+
+    n0 = 5
+    for k in range(n0):
+        a = TAU * k / n0 + rnd.uniform(-0.2, 0.2)
+        e = math.radians(rnd.uniform(46, 60))
+        fork(trunk[-1] - UP * 0.8, V(math.cos(a) * math.cos(e), math.sin(e), math.sin(a) * math.cos(e)), 9.0, tr[-1] * 0.62, 0)
+    top_y = sum(p.y for p, _ in tips) / len(tips)
+    crown = V(0, top_y - 3.0, 0)
+    ext = max(V(p.x, 0, p.z).length for p, _ in tips) + 4
+    ao = ao_crown(crown, ext, 6.0, base=0.55)
+    pts = [p for p, _ in tips]
+    # fill the umbrella between the tips so the top is one dense, flat-domed mass
+    for _ in range(40):
+        a = rnd.uniform(0, TAU); r = ext * math.sqrt(rnd.uniform(0.0, 0.85))
+        pts.append(V(math.cos(a) * r, top_y + 2.0 - 5.0 * (r / ext) ** 2 + rnd.uniform(-1.2, 1.2), math.sin(a) * r))
+    for p in pts:
+        rad = V(p.x, 0, p.z)
+        rad = rad.normalized() if rad.length > 0.5 else rand_unit(rnd)
+        rad.y = 0; rad.normalize()
+        for k in range(3):
+            ang = (k - 1) * 0.9 + rnd.uniform(-0.3, 0.3)
+            dirh = (rad * math.cos(ang) + UP.cross(rad) * math.sin(ang)).normalized()
+            up = (dirh + UP * rnd.uniform(0.2, 0.45)).normalized()
+            face = (UP + rad * 0.35 + rand_unit(rnd) * 0.15).normalized()
+            s = rnd.uniform(7.5, 10.0)
+            card(leaves, p - dirh * s * 0.25, up, face, s, s * 0.9, 0, crown, ao, 0.08, bend=-0.12, nmix=0.65)
+    # glowing filaments under the rim of the umbrella
+    for k in range(34):
+        a = TAU * k / 34 + rnd.uniform(-0.08, 0.08)
+        r = ext * rnd.uniform(0.62, 0.95)
+        p = V(math.cos(a) * r, top_y - 1.5 - 3.5 * (r / ext) ** 2, math.sin(a) * r)
+        hang(leaves, p, rnd.uniform(7, 15), rnd.uniform(3.0, 4.2), V(math.cos(a), 0, math.sin(a)), 2, crown, ao, 0.9)
+    # far version: six big fans on the dome, a few curtains, a stub trunk
+    for k in range(6):
+        a = TAU * k / 6 + 0.3
+        rad = V(math.cos(a), 0, math.sin(a))
+        card(lo, V(0, top_y - 1.0, 0) + rad * 1.0, (rad + UP * 0.22).normalized(), (UP + rad * 0.3).normalized(), ext * 1.05, ext * 1.08, 0, crown, ao, 0.08, bend=-0.08, nmix=0.8)
+    for k in range(5):
+        a = TAU * k / 5
+        hang(lo, V(math.cos(a), 0, math.sin(a)) * ext * 0.7 + UP * (top_y - 4), 11, 12, V(math.cos(a), 0, math.sin(a)), 2, crown, ao, 0.9)
+    tube(lo, [trunk[0], trunk[5], trunk[9]], [3.2, 2.5, 2.0], 5, col, cell=3)
+    return [bark, leaves, lo]
+
+
+def veilwillow(idx, seed):
+    rnd = random.Random(seed)
+    nm = "canopy%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    col = (0.74, 0.8, 0.9)
+    H = 19.0
+    lean = V(rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1)).normalized() * 2.5
+    trunk = smooth_path([V(0, -3, 0), V(0, 5, 0) + lean * 0.2, V(0, 12, 0) + lean * 0.7, V(0, H, 0) + lean], 10)
+    tr = [2.4 * (1 - 0.4 * (i / 9)) + 1.4 * max(0.0, 1 - i / 2.2) ** 2 for i in range(10)]
+    vg = spiral_glow(0.5, 4, 0.9, 0.5)
+    tube(bark, trunk, tr, 10, col, glow=vg)
+    roots_ring(bark, rnd, col, 7, 2.0, 5, 8)
+    crown = trunk[-1] + V(0, 2, 0)
+    ao = ao_crown(crown, 20, 10, base=0.6)
+    arcs = []
+    nl = 7
+    for k in range(nl):
+        a = TAU * k / nl + rnd.uniform(-0.25, 0.25)
+        o = V(math.cos(a), 0, math.sin(a))
+        reach = rnd.uniform(13, 19)
+        p0 = trunk[rnd.randint(7, 9)]
+        ctrl = [p0, p0 + o * reach * 0.3 + UP * 7, p0 + o * reach * 0.65 + UP * 8.5, p0 + o * reach - UP * 1.5]
+        path = smooth_path(ctrl, 9)
+        tube(bark, path, [tr[8] * 0.55 * (1 - 0.8 * i / 8) + 0.08 for i in range(9)], 6, col, glow=vg)
+        arcs.append(path)
+        # two side arches off each limb
+        for s in (-1, 1):
+            q = path[3]
+            sd = (o.cross(UP) * s + o * 0.6).normalized()
+            sub = smooth_path([q, q + sd * 4 + UP * 3.5, q + sd * 8 + UP * 2, q + sd * 10 - UP * 2], 6)
+            tube(bark, sub, [0.35 * (1 - 0.8 * i / 5) + 0.05 for i in range(6)], 4, col)
+            arcs.append(sub)
+    for path in arcs:
+        for i in range(1, len(path)):
+            for _ in range(2):
+                p = path[i - 1].lerp(path[i], rnd.random())
+                out = V(p.x - crown.x, 0, p.z - crown.z)
+                # curtains fall almost to the ground
+                L = max(4.0, (p.y + 1.0) * rnd.uniform(0.6, 0.92))
+                hang(leaves, p, L, rnd.uniform(2.8, 3.8), out, 2, crown, ao, 1.0, sway=rnd.uniform(-0.05, 0.05))
+            if i % 2 == 0:
+                p = path[i]
+                out = V(p.x - crown.x, 0, p.z - crown.z).normalized()
+                dirp = (path[i] - path[i - 1]).normalized()
+                card(leaves, p, (dirp + UP * 0.4).normalized(), (UP + out * 0.5).normalized(), 6.0, 5.5, 1, crown, ao, 0.12, bend=-0.1, nmix=0.6)
+    for k in range(6):
+        a = TAU * k / 6 + 0.2
+        o = V(math.cos(a), 0, math.sin(a))
+        hang(lo, trunk[-1] + o * 9 + UP * 6, 21, 15, o, 2, crown, ao, 1.0)
+    card(lo, trunk[-1] - UP * 2, UP, V(1, 0, 0), 30, 14, 1, crown, ao, 0.1, bend=0, nmix=0.8)
+    card(lo, trunk[-1] - UP * 2, UP, V(0, 0, 1), 30, 14, 1, crown, ao, 0.1, bend=0, nmix=0.8)
+    tube(lo, [trunk[0], trunk[5], trunk[9]], [2.4, 1.8, 1.3], 5, col, cell=3)
+    return [bark, leaves, lo]
+
+
+def cloudpad(idx, seed):
+    rnd = random.Random(seed)
+    nm = "canopy%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    col = (0.62, 0.52, 0.5)
+    H = 17.0
+    vg = spiral_glow(0.6, 2, 0.88, 0.75)
+    # two stems braided round each other
+    for s in range(2):
+        pts = []
+        for i in range(14):
+            t = i / 13
+            a = s * math.pi + t * TAU * 0.9
+            r = 1.5 + 1.2 * (1 - t) ** 3
+            pts.append(V(math.cos(a) * r, -3 + t * (H + 3), math.sin(a) * r))
+        tube(bark, pts, [2.0 * (1 - 0.35 * i / 13) + 1.0 * max(0, 1 - i / 2.5) ** 2 for i in range(14)], 9, col, glow=vg)
+    roots_ring(bark, rnd, col, 8, 2.2, 5, 9, glow=vg)
+    top = V(0, H, 0)
+    pads = [(top + V(0, 10, 0), 9.0)]
+    np_ = 5
+    for k in range(np_):
+        a = TAU * k / np_ + rnd.uniform(-0.25, 0.25)
+        o = V(math.cos(a), 0, math.sin(a))
+        reach, lift = rnd.uniform(10, 16), rnd.uniform(-2, 9)
+        end = top + o * reach + UP * lift
+        limb = smooth_path([top - UP * 2, top + o * reach * 0.35 + UP * (lift + 4), end], 8)
+        tube(bark, limb, [1.4 * (1 - 0.7 * i / 7) + 0.2 for i in range(8)], 6, col, glow=vg)
+        pads.append((end + UP * 1.0, rnd.uniform(7.0, 9.5)))
+    crown = top + V(0, 5, 0)
+    ao = ao_crown(crown, 20, 9, base=0.62)
+    for c, R in pads:
+        # a flattened dome of fans, normals from just under its middle (a soft cushion)
+        ctr = c - UP * 1.2
+        for k in range(int(R * 3.2)):
+            a = rnd.uniform(0, TAU); rr = R * math.sqrt(rnd.uniform(0.05, 1.0))
+            p = c + V(math.cos(a) * rr, 1.6 * (1 - (rr / R) ** 2) + rnd.uniform(-0.3, 0.3), math.sin(a) * rr)
+            rad = V(math.cos(a), 0, math.sin(a))
+            up = (rad + UP * 0.35 + rand_unit(rnd) * 0.3).normalized()
+            face = (UP * (1.2 - rr / R) + rad * (rr / R) + rand_unit(rnd) * 0.2).normalized()
+            s = rnd.uniform(6.0, 8.0)
+            card(leaves, p - up * s * 0.3, up, face, s, s * 0.9, 0, ctr, ao, 0.1, bend=-0.15, nmix=0.75)
+        for k in range(rnd.randint(4, 6)):
+            a = rnd.uniform(0, TAU); rr = R * rnd.uniform(0.3, 0.8)
+            lantern(bark, rnd, c + V(math.cos(a) * rr, -0.6, math.sin(a) * rr), rnd.uniform(1.2, 3.0), rnd.uniform(0.32, 0.5))
+        card(lo, c - V(R, 0.2, 0), V(1, 0.05, 0), UP, R * 2.0, R * 2.3, 0, ctr, ao, 0.1, bend=0, nmix=0.85)
+        card(lo, c - V(0, 0.2, R), V(0, 0.05, 1), UP, R * 2.0, R * 2.3, 0, ctr, ao, 0.1, bend=0, nmix=0.85)
+    tube(lo, [V(0, -3, 0), V(0, H * 0.5, 0), top], [2.8, 2.0, 1.6], 5, col, cell=3)
+    return [bark, leaves, lo]
+
+
+def corkscrew(idx, seed):
+    rnd = random.Random(seed)
+    nm = "spire%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    col = (0.85, 0.82, 0.92)
+    H = 58.0
+    ph = rnd.uniform(0, TAU)
+    trunk = []
+    for i in range(30):
+        t = i / 29
+        a = ph + t * TAU * 1.6
+        r = 1.8 * (1 - t) + 0.25
+        trunk.append(V(math.cos(a) * r, -3 + t * (H + 3), math.sin(a) * r))
+    tr = [2.1 * (1 - i / 29) ** 0.9 + 0.12 + 1.2 * max(0.0, 1 - i / 3) ** 2 for i in range(30)]
+    vg = spiral_glow(0.42, 5, 0.86, 0.8)
+    tube(bark, trunk, tr, 9, col, glow=vg)
+    roots_ring(bark, rnd, col, 6, 2.0, 4, 6.5)
+    crown = V(0, H * 0.45, 0)
+    ao = ao_crown(V(0, H * 0.45, 0), 12, 27, base=0.66)
+    # a spiral staircase of plumes winding three and a half times up the trunk
+    n = 96
+    for k in range(n):
+        s = 0.12 + 0.86 * k / n
+        a = ph + s * TAU * 3.5
+        y = -3 + s * (H + 3)
+        R = 12.5 * (1 - s) ** 0.85 + 1.8
+        hz = V(math.cos(a), 0, math.sin(a))
+        tang = UP.cross(hz).normalized()
+        base = V(0, y, 0)
+        tip = base + hz * R + UP * (0.6 - 1.6 * (1 - s))
+        if k % 2 == 0 and R > 3:
+            tube(bark, [base, base.lerp(tip, 0.5) + UP * 0.6, tip], [0.32 * (1 - s) + 0.08, 0.16, 0.05], 3, col)
+        for j, f in enumerate((0.45, 0.85)):
+            p = base.lerp(tip, f)
+            sz = (R * 0.7 + 4.0) * (0.8 + 0.2 * j)
+            up = (hz * 0.8 + tang * 0.55 + UP * 0.25).normalized()
+            face = (UP * 0.8 + hz * 0.4 - tang * 0.3).normalized()
+            card(leaves, p, up, face, sz * 0.8, sz, 1, crown, ao, 0.05 + 0.08 * s, bend=-0.15, nmix=0.55)
+    # the bud: a cluster of glowing seeds at the very top
+    for k in range(5):
+        octa(bark, trunk[-1] + UP * (0.8 + k * 0.7) + rand_unit(rnd) * 0.5, 0.55 - 0.07 * k, (0.95, 0.9, 1.0), 1.0, 1.6)
+    for k in range(4):
+        a = ph + k * TAU / 4
+        hz = V(math.cos(a), 0, math.sin(a))
+        card(lo, V(0, 1.0, 0), UP, hz, 26, H * 0.95, 1, crown, ao, 0.15, bend=0, nmix=0.8)
+    tube(lo, [trunk[0], trunk[14], trunk[29]], [2.0, 1.0, 0.15], 4, col, cell=3)
+    return [bark, leaves, lo]
+
+
+def lanternfir(idx, seed):
+    rnd = random.Random(seed)
+    nm = "spire%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    H = 55.0
+    trunk = grow(V(0, -3, 0), UP, H + 3, 10, rnd, wobble=0.025)
+    tr = [1.9 * (1 - i / 10) ** 0.9 + 0.08 + 1.0 * max(0.0, 1 - i / 1.5) ** 2 for i in range(11)]
+    col = (0.55, 0.5, 0.62)
+    vg = spiral_glow(0.3, 3, 0.9, 0.6)
+    tube(bark, trunk, tr, 9, col, glow=vg)
+    roots_ring(bark, rnd, col, 6, 1.9, 4, 6)
+    crown = V(0, H * 0.55, 0)
+    ao = ao_crown(V(0, H * 0.5, 0), 12, 26, base=0.66)
+    y, w = 7.0, 0
+    while y < H - 3:
+        t = (y - 7) / (H - 10)
+        L = 14.0 * (1 - t) ** 1.05 + 2.2
+        n = 6 if t < 0.55 else 5
+        for k in range(n):
+            a = TAU * (k + 0.5 * (w % 2)) / n + rnd.uniform(-0.3, 0.3)
+            hz = V(math.cos(a), 0, math.sin(a))
+            d = (hz + UP * rnd.uniform(0.15, 0.4)).normalized()
+            Lk = L * rnd.uniform(0.85, 1.1)
+            limb = grow(V(0, y, 0), d, Lk, 3, rnd, droop=0.9, wobble=0.06)
+            if Lk > 4 and (k + w) % 2 == 0:
+                tube(bark, limb, [0.3 * (1 - t) + 0.1, 0.17, 0.09, 0.03], 3, col)
+            ns = max(2, int(Lk / 3.5))
+            for s in range(ns):
+                f = (s + 0.5) / ns
+                j = min(3, int(f * 3) + 1)
+                p = limb[j - 1].lerp(limb[j], f * 3 - (j - 1))
+                seg = (limb[j] - limb[j - 1]).normalized()
+                sz = min(9.5, Lk * 0.7 + 3.0) * (1.0 - 0.3 * f)
+                for sgn in (-1, 1):
+                    out = (UP + hz.cross(UP) * rnd.uniform(0.25, 0.6) * sgn + hz * 0.25).normalized()
+                    card(leaves, p, (seg + UP * rnd.uniform(-0.15, 0.1)).normalized(), out, sz * 0.8, sz, 1, crown, ao, 0.1, bend=-0.15, nmix=0.6)
+            if (k + w) % 2 == 1 and Lk > 3:
+                lantern(bark, rnd, limb[-1], rnd.uniform(0.8, 2.2), 0.42 + 0.25 * (1 - t), rnd.choice([(1.0, 0.9, 0.7), (0.85, 0.95, 1.0)]))
+        y += 3.1 + 1.2 * t + rnd.uniform(-0.3, 0.3)
+        w += 1
+    for k in range(3):
+        a = k * math.pi / 3 + 0.5
+        card(leaves, V(0, H * 0.35, 0), UP, V(math.cos(a), 0, math.sin(a)), 9, H * 0.6, 1, crown, ao, 0.1, bend=0.0, nmix=0.7)
+    octa(bark, V(0, H + 1.5, 0), 0.9, (0.9, 0.95, 1.0), 1.0, 1.8)
+    for k in range(3):
+        a = k * math.pi / 3 + 0.3
+        card(lo, V(0, 3.0, 0), UP, V(math.cos(a), 0, math.sin(a)), 34, H * 0.74, 1, crown, ao, 0.12, bend=0.0, nmix=0.8)
+        b = a + math.pi / 6
+        card(lo, V(0, H * 0.42, 0), UP, V(math.cos(b), 0, math.sin(b)), 19, H * 0.6, 1, crown, ao, 0.12, bend=0.0, nmix=0.8)
+    tube(lo, [trunk[0], trunk[5], trunk[10]], [1.8, 0.9, 0.1], 4, col, cell=3)
+    return [bark, leaves, lo]
+
+
+def bellcap(idx, seed):
+    rnd = random.Random(seed)
+    nm = "spire%d" % idx
+    bark, leaves, lo = Mesh(nm + "_bark"), Mesh(nm + "_leaves"), Mesh(nm + "_lo")
+    col = (0.9, 0.86, 0.8)
+    H = 60.0
+    bendv = V(rnd.uniform(-1, 1), 0, rnd.uniform(-1, 1)).normalized()
+    trunk = smooth_path([V(0, -3, 0), V(0, 15, 0) + bendv * 1.2, V(0, 35, 0) - bendv * 1.0, V(0, H, 0) + bendv * 0.8], 16)
+    tr = [1.5 * (1 - 0.6 * i / 15) + 1.0 * max(0.0, 1 - i / 2.5) ** 2 for i in range(16)]
+    vg = spiral_glow(0.25, 6, 0.85, 0.9)
+    tube(bark, trunk, tr, 8, col, glow=vg)
+    roots_ring(bark, rnd, col, 7, 1.8, 4, 7, glow=vg)
+    ao = ao_crown(V(0, H * 0.65, 0), 16, 25, base=0.65)
+    bells = [(H, 9.0), (H * 0.72, 12.5), (H * 0.47, 15.5)]
+    for bi, (y, R) in enumerate(bells):
+        i = min(15, round((y + 3) / (H + 3) * 15))
+        c = trunk[i] + UP * 2.5
+        crown = c - UP * 3.0
+        # ribs, like an umbrella's, from the stalk out to the rim
+        nr = 7
+        for k in range(nr):
+            a = TAU * k / nr + bi
+            rim = c + V(math.cos(a) * R, -R * 0.45, math.sin(a) * R)
+            rib = smooth_path([c - UP * 0.5, c + V(math.cos(a) * R * 0.5, 0.2, math.sin(a) * R * 0.5), rim], 6)
+            tube(bark, rib, [0.45, 0.35, 0.25, 0.18, 0.12, 0.08], 3, col, glow=vg)
+        # the bell: rings of fans on a dome, facing out
+        for ring, th in enumerate((0.25, 0.6, 0.95, 1.25)):
+            nk = int(5 + R * (0.55 + ring * 0.25))
+            for k in range(nk):
+                a = TAU * (k + 0.5 * (ring % 2)) / nk + rnd.uniform(-0.1, 0.1)
+                nrm = V(math.cos(a) * math.sin(th), math.cos(th), math.sin(a) * math.sin(th))
+                p = c + V(nrm.x * R, (nrm.y - 1) * R * 0.5 + 0.3, nrm.z * R) * 0.95
+                tang = V(-math.sin(a), 0, math.cos(a))
+                down = nrm.cross(tang).normalized()
+                s = rnd.uniform(4.5, 6.0) * (0.8 + R / 30)
+                card(leaves, p + down * s * 0.4, -down, (nrm + rand_unit(rnd) * 0.15).normalized(), s, s * 0.95, 0, crown, ao, 0.03 + 0.05 * ring, bend=-0.1, nmix=0.7)
+        # the trailing fringe
+        nf = int(R * 1.6)
+        for k in range(nf):
+            a = TAU * k / nf + rnd.uniform(-0.1, 0.1)
+            rr = R * rnd.uniform(0.85, 1.0)
+            p = c + V(math.cos(a) * rr, -R * 0.45 * (rr / R) ** 2 - 0.5, math.sin(a) * rr)
+            hang(leaves, p, rnd.uniform(5, 9) + R * 0.35, rnd.uniform(2.6, 3.6), V(math.cos(a), 0, math.sin(a)), 2, crown, ao, 1.0)
+        for k in range(3):
+            a = k * math.pi / 3 + bi
+            o = V(math.cos(a), 0, math.sin(a))
+            card(lo, c - o * R + UP * 1.0, o, -UP * 0.2 + V(-o.z, 0, o.x), R * 2.1, R * 0.9, 0, crown, ao, 0.2, bend=0, nmix=0.85)
+        for k in range(4):
+            a = TAU * k / 4 + bi
+            o = V(math.cos(a), 0, math.sin(a))
+            hang(lo, c + o * R * 0.6 - UP * R * 0.25, R * 1.0, R * 1.3, o, 2, crown, ao, 1.0)
+    tube(lo, [trunk[0], trunk[8], trunk[15]], [1.6, 1.0, 0.6], 4, col, cell=3)
+    return [bark, leaves, lo]
+
+
+SPECIES = [(parasol, 1, 11), (veilwillow, 2, 23), (cloudpad, 3, 31), (corkscrew, 1, 41), (lanternfir, 2, 53), (bellcap, 3, 61)]
+
+
 def to_bl(p):
     return Vector((p.x, -p.z, p.y))
 
@@ -712,7 +1232,7 @@ def render_previews(objs):
     sc.render.resolution_x, sc.render.resolution_y = 1100, 560
     sc.view_settings.view_transform = "AgX"
     sc.world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.55, 0.68, 0.9, 1)
-    leaves_img = bpy.data.images.load(os.path.join(ROOT, "tex", "leaves.png"))
+    leaves_img = bpy.data.images.load(os.path.join(ROOT, "tex", "alien.png"))
     bark_img = bpy.data.images.load(os.path.join(ROOT, "tex", "bark_c.jpg"))
     def tex_mat(img, alpha):
         mat = bpy.data.materials.new(img.name); mat.use_nodes = True
@@ -737,9 +1257,10 @@ def render_previews(objs):
     for i, nm in enumerate(names):
         for o in objs:
             if o.name.startswith(nm + "_"):
-                o.location = ((i - 1.5) * 45, 60 if o.name.endswith("_lo") else 0, 0)
-    cam.location = (0, -300, 34)
-    cam.rotation_euler = (math.radians(86), 0, 0)
+                o.location = ((i - (len(names) - 1) / 2) * 55, 70 if o.name.endswith("_lo") else 0, 0)
+    sc.render.resolution_x, sc.render.resolution_y = 1600, 600
+    cam.location = (0, -430, 28)
+    cam.rotation_euler = (math.radians(90), 0, 0)
     sc.render.filepath = os.path.join(ROOT, "tools", "blender", "renders", "trees.png")
     bpy.ops.render.render(write_still=True)
     log("rendered", sc.render.filepath)
@@ -747,13 +1268,16 @@ def render_previews(objs):
 
 def main():
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    build_atlas((cluster_broadleaf, cluster_conifer, cluster_weeper), "leaves", bark=True)
-    build_atlas((cluster_grass, cluster_fern, cluster_flowers, cluster_bush), "undergrowth", seed=11)
+    # the green atlases (vines, the Worldtree's old crown, ground cover) only on request
+    if "--all-atlases" in argv:
+        build_atlas((cluster_broadleaf, cluster_conifer, cluster_weeper), "leaves", bark=True)
+        build_atlas((cluster_grass, cluster_fern, cluster_flowers, cluster_bush), "undergrowth", seed=11)
+    if "--no-atlas" not in argv:
+        build_atlas((cluster_fan, cluster_plume, cluster_filaments), "alien", bark=True, seed=5)
     objs = []
-    for build, seeds in ((canopy, (1, 2)), (spire, (1, 2))):
-        for s in seeds:
-            for m in build(s):
-                objs.append(make_object(m))
+    for build, idx, seed in SPECIES:
+        for m in build(idx, seed):
+            objs.append(make_object(m))
     out = os.path.join(ROOT, "models", "trees.glb")
     bpy.ops.object.select_all(action="DESELECT")
     for o in objs:

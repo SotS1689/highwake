@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { CROWN, GATES, CHIMES, BELL, THERMALS, entitySDF, gauntletRings } from "./world.js";
-import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES, ATLAS_BROADLEAF, ATLAS_HANGING, textures } from "./gfx.js";
+import { shared, glowMaterial, foliageMaterial, buildParts, M4, roughen, SHADER_END, UV_LEAVES, ATLAS_BROADLEAF, ATLAS_HANGING, ALIEN_FAN, ALIEN_FILAMENT, textures } from "./gfx.js";
 import { mulberry32, makeNoise } from "./noise.js";
 
 export const NOTE_COLORS = ["#ff7a6b", "#ffc15a", "#7dff9a", "#6fd8ff", "#c79bff"];
@@ -210,10 +210,12 @@ export class Landmarks {
 
     // ---- the Worldtree ----------------------------------------------------------------
     // A braided giant: six stems twist round each other into one column, then part into
-    // sweeping limbs that carry tiers of pale, cloud-like foliage far past the island's
-    // rim. Its roots crawl over the edge and hang hundreds of metres into the open sky.
-    // By night the crown, the root tips and the veins in the bark glow cyan and violet,
-    // and lantern-fruit hang under every tier.
+    // sweeping limbs that carry vast flat shelves of moon-silver sword-leaves (the
+    // otherworldly atlas) far past the island's rim, violet underneath. From the rim of
+    // every shelf, curtains of beaded filaments fall hundreds of metres into the open sky,
+    // and the roots crawl over the edge and hang down after them. A cluster of seed-hearts
+    // crowns the leader. By night the filaments, the shelves' undersides, the seed-hearts
+    // and the veins in the bark glow, and lantern-fruit hang under every shelf.
     _worldtree() {
         const e = this.byId.verdance;
         const top = surfaceY(e, 0, 0);
@@ -296,10 +298,9 @@ export class Landmarks {
             capsule(limb[0], limb[13], 48);
             capsule(limb[13], limb[25], 22);
             skel.push(...limb.slice(7));
-            padAt(limb[25].clone().add(V3(0, 50, 0)), 290 + rand() * 70, 0);
-            padAt(limb[15].clone().add(V3(0, 110, 0)), 270 + rand() * 60, 1);
-            padAt(limb[20].clone().add(V3(0, 80, 0)).addScaledVector(side, (rand() - 0.5) * 200), 260 + rand() * 60, 1);
-            padAt(limb[9].clone().add(V3(0, 150, 0)), 230 + rand() * 50, 2);
+            padAt(limb[25].clone().add(V3(0, 50, 0)), 330 + rand() * 80, 0);
+            padAt(limb[15].clone().add(V3(0, 110, 0)), 310 + rand() * 70, 1);
+            padAt(limb[9].clone().add(V3(0, 150, 0)), 260 + rand() * 60, 2);
             // two forks sweeping off to either side
             for (const sgn of [-1, 1]) {
                 const i0 = sgn < 0 ? 9 : 16, q0 = limb[i0];
@@ -313,12 +314,11 @@ export class Landmarks {
                 addTube(fork, ridged(fork, 26, 1.5, 6), 12, "#bdb09c");
                 capsule(fork[0], fork[fork.length - 1], 16);
                 skel.push(...fork.slice(3));
-                padAt(fork[fork.length - 1].clone().add(V3(0, 55, 0)), 240 + rand() * 60, 2);
-                padAt(fork[7].clone().add(V3(0, 70, 0)), 200 + rand() * 50, 2);
+                padAt(fork[fork.length - 1].clone().add(V3(0, 55, 0)), 280 + rand() * 70, 2);
             }
         }
-        padAt(leader[leader.length - 1].clone().add(V3(0, 40, 0)), 340, 0);
-        padAt(V3(0, H + 330, 0), 380, 1);
+        padAt(leader[leader.length - 1].clone().add(V3(0, 40, 0)), 300, 0);
+        padAt(V3(0, H + 330, 0), 440, 1);
 
         // ---- roots: over the rim and down into the sky ----
         const rimAt = (a) => {
@@ -369,14 +369,14 @@ export class Landmarks {
         // limbs and fans out through the mass, and clumps of crossed leaf cards sit along
         // their outer half, so the crown is airy, with sky and branches showing through.
         // Pale silver-jade on top, deep teal underneath; the undersides glow at night.
-        const top0 = new THREE.Color("#eafff4"), bot0 = new THREE.Color("#3f8590"), mist = new THREE.Color("#d6c9ff");
+        const top0 = new THREE.Color("#f2fbff"), bot0 = new THREE.Color("#4a3d96"), mist = new THREE.Color("#ffd0ec");
         const tmpC = new THREE.Color();
         const rq = () => { const u = rand() * 2 - 1, a = rand() * Math.PI * 2, r = Math.sqrt(1 - u * u); return V3(Math.cos(a) * r, u, Math.sin(a) * r); };
         this.tendrilSpots = [];
         for (const pd of pads) {
             const { c, R } = pd;
-            const thick = R * 0.42;
-            this.colliders.push({ t: "s", c: toWorld(c), r: R * 0.42 });
+            const thick = R * 0.16;      // shelves: wide and flat-topped, not round puffs
+            this.colliders.push({ t: "s", c: toWorld(c), r: R * 0.3 });
             const near = skel.filter((q) => q.distanceTo(c) < R * 1.2);
             if (!near.length) near.push(skel.reduce((b, q) => (q.distanceTo(c) < b.distanceTo(c) ? q : b), skel[0]));
             const nb = Math.round(R / 13);
@@ -394,37 +394,39 @@ export class Landmarks {
                 for (let j = 0; j < nClumps; j++) {
                     const t = 0.35 + 0.65 * (j + rand() * 0.6) / nClumps;
                     const i = Math.min(br.length - 1, Math.round(t * (br.length - 1)));
-                    const q = br[i].clone().addScaledVector(rq(), 30);
+                    const q = br[i].clone().addScaledVector(rq().multiply(V3(1, 0.35, 1)), 34);
                     const h = THREE.MathUtils.clamp((q.y - (c.y - thick)) / (2 * thick), 0, 1);
                     tmpC.copy(bot0).lerp(top0, Math.pow(h, 0.8));
                     tmpC.multiplyScalar(0.88 + rand() * 0.24);
-                    if (rand() < 0.1) tmpC.lerp(mist, 0.65);   // a few lavender-silver clumps
+                    if (rand() < 0.12) tmpC.lerp(mist, 0.6);   // a few rose-silver clumps
                     const hex = "#" + tmpC.getHexString();
-                    const glow = (1 - h) * 0.45 + (rand() < 0.06 ? 0.5 : 0);
-                    const out = q.clone().sub(c).divideScalar(R).add(V3(0, 0.6, 0));
+                    const glow = (1 - h) * 0.4 + (rand() < 0.05 ? 0.45 : 0);
+                    const out = q.clone().sub(c).divideScalar(R).add(V3(0, 1.3, 0));
                     for (let n = 0; n < 4 + (rand() < 0.5 ? 1 : 0); n++) {
                         const nrm = rq().addScaledVector(out, 0.9).normalize();
                         const qq = new THREE.Quaternion().setFromUnitVectors(V3(0, 0, 1), nrm);
                         qq.multiply(new THREE.Quaternion().setFromAxisAngle(V3(0, 0, 1), rand() * 6.28));
                         const sz = 42 + rand() * 30;
                         leaves.push({
-                            geo: new THREE.PlaneGeometry(sz, sz), uvRect: ATLAS_BROADLEAF, normalFrom: [c.x, c.y - thick * 0.6, c.z],
+                            geo: new THREE.PlaneGeometry(sz, sz), uvRect: ALIEN_FAN, normalFrom: [c.x, c.y - thick * 1.6, c.z],
                             matrix: new THREE.Matrix4().compose(q.clone().addScaledVector(rq(), 8), qq, V3(1, 1, 1)), color: hex, glow,
                         });
                     }
                 }
             }
-            // the fringe: fronds hanging round the rim of the tier
-            const nFr = Math.round(R * 0.05);
+            // the curtains: beaded filaments falling from the rim of the shelf, longest on
+            // the outermost shelves (tier 0), so the crown trails veils into the sky
+            const nFr = Math.round(R * 0.04);
             for (let k = 0; k < nFr; k++) {
-                const a = (k / nFr) * Math.PI * 2 + rand() * 0.2, rr = R * (0.7 + rand() * 0.28);
-                const p = V3(c.x + Math.cos(a) * rr, c.y - thick * 0.25, c.z + Math.sin(a) * rr);
-                const len = 60 + rand() * 80;
+                const a = (k / nFr) * Math.PI * 2 + rand() * 0.2, rr = R * (0.72 + rand() * 0.26);
+                const p = V3(c.x + Math.cos(a) * rr, c.y - thick * 0.35, c.z + Math.sin(a) * rr);
+                const len = (pd.tier === 0 ? 160 : 90) + rand() * (pd.tier === 0 ? 300 : 160);
                 const q = new THREE.Quaternion().setFromAxisAngle(V3(0, 1, 0), -a + Math.PI / 2 + (rand() - 0.5) * 0.6);
+                const tint = tmpC.set(rand() < 0.3 ? "#f3d6ff" : rand() < 0.5 ? "#d4f6ff" : "#e8fff6");
                 leaves.push({
-                    geo: new THREE.PlaneGeometry(len * 0.55, len).translate(0, -len / 2, 0), uvRect: ATLAS_HANGING,
+                    geo: new THREE.PlaneGeometry(len * 0.3, len, 1, 4).translate(0, -len / 2, 0), uvRect: ALIEN_FILAMENT,
                     normalFrom: [c.x, c.y + thick, c.z], matrix: new THREE.Matrix4().compose(p, q, V3(1, 1, 1)),
-                    color: "#b9eadf", glow: (x, y) => THREE.MathUtils.clamp((p.y - y) / len, 0, 1) * 0.9,
+                    color: "#" + tint.getHexString(), glow: (x, y) => 0.15 + THREE.MathUtils.clamp((p.y - y) / len, 0, 1) * 0.85,
                 });
             }
             // lantern-fruit and glowing tendrils under the tier
@@ -432,23 +434,32 @@ export class Landmarks {
                 const a = rand() * Math.PI * 2, rr = Math.sqrt(rand()) * R * 0.75;
                 fruit.push([c.x + Math.cos(a) * rr, c.y - thick * 0.6 - 10 - rand() * 50, c.z + Math.sin(a) * rr, 2.5 + rand() * 3]);
             }
-            for (let k = 0; k < Math.round(R / 32); k++) {
-                const a = rand() * Math.PI * 2, rr = Math.sqrt(rand()) * R * 0.85;
-                this.tendrilSpots.push([c.x + Math.cos(a) * rr, c.y - thick * 0.55, c.z + Math.sin(a) * rr, 80 + rand() * 260]);
+            // the veils: a thousand-odd glowing strands, thickest round the rim of each shelf,
+            // longest under the outer shelves, so the whole crown trails curtains into the sky
+            for (let k = 0; k < Math.round(R / 9); k++) {
+                const a = rand() * Math.PI * 2, rr = Math.pow(rand(), 0.35) * R * 0.95;
+                const L = ((pd.tier === 0 ? 260 : pd.tier === 1 ? 170 : 110) + rand() * (pd.tier === 0 ? 720 : 420)) * (0.3 + 0.7 * rr / R);
+                this.tendrilSpots.push([c.x + Math.cos(a) * rr, c.y - thick * 0.45, c.z + Math.sin(a) * rr, L]);
             }
         }
 
+        // seed-hearts: great glowing teardrops clustered round the top of the leader
+        const crest = leader[leader.length - 1];
+        for (let k = 0; k < 9; k++) {
+            const a = (k / 9) * Math.PI * 2 + rand() * 0.4, rr = 30 + rand() * 45;
+            fruit.push([crest.x + Math.cos(a) * rr, crest.y + 10 + rand() * 60, crest.z + Math.sin(a) * rr, 9 + rand() * 9]);
+        }
         const tree = new THREE.Mesh(buildParts(bark), glowMaterial({ roughness: 0.85 }, "#7fe8ff", false, "bark"));
         tree.position.copy(base);
         this.scene.add(tree);
-        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#8ff3ff", textures().leaves, true, 0.3));
+        const crown = new THREE.Mesh(buildParts(leaves), foliageMaterial("#8ff3ff", textures().alien, 1.45, 0.3, true));
         crown.position.copy(base);
         this.scene.add(crown);
         // glowing tendrils (the reason to come back at night)
-        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.2, 1, 4, 8).translate(0, -0.5, 0), color: "#6a8f9a", glow: (x, y) => 0.35 - y * 0.65 }]);
+        const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.15, 1, 4, 5).translate(0, -0.5, 0), color: "#cdd2ff", glow: (x, y) => 0.25 - y * 0.75 }]);
         const im = new THREE.InstancedMesh(tg, glowMaterial({ roughness: 0.8 }, "#c39bff"), this.tendrilSpots.length);
         const m4 = new THREE.Matrix4();
-        this.tendrilSpots.forEach((t, i) => im.setMatrixAt(i, m4.compose(V3(t[0], t[1], t[2]), new THREE.Quaternion(), V3(1.5, t[3], 1.5))));
+        this.tendrilSpots.forEach((t, i) => im.setMatrixAt(i, m4.compose(V3(t[0], t[1], t[2]), new THREE.Quaternion(), V3(1.4 + (i % 3) * 0.5, t[3], 1.4 + (i % 3) * 0.5))));
         im.position.copy(base);
         im.computeBoundingSphere();
         this.scene.add(im);

@@ -176,10 +176,10 @@ export function textures() {
     TEX = {
         cliff: get("cliff_c.jpg"), cliffN: get("cliff_n.jpg", false), rock: get("rock_c.jpg"),
         grass: get("grass_c.jpg"), grassN: get("grass_n.jpg", false), tree: get("tree_atlas.png"), bark: get("bark_c.jpg"),
-        leaves: get("leaves.png"), undergrowth: get("undergrowth.png"),
+        leaves: get("leaves.png"), undergrowth: get("undergrowth.png"), alien: get("alien.png"),
     };
-    // the leaves atlas is addressed with glTF uvs (no flip), cells must not bleed into each other
-    for (const t of [TEX.leaves, TEX.undergrowth]) { t.flipY = false; t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; }
+    // the leaves atlases are addressed with glTF uvs (no flip), cells must not bleed into each other
+    for (const t of [TEX.leaves, TEX.undergrowth, TEX.alien]) { t.flipY = false; t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; }
     TEX.tree.wrapS = TEX.tree.wrapT = THREE.ClampToEdgeWrapping;
     return TEX;
 }
@@ -348,13 +348,17 @@ export function addWind(m, strength = 1, flutter = true) {
 // anti-aliased with alpha-to-coverage where the scene is multisampled.
 // recolor: take only the texture's light and shade and let the vertex colours set the
 // hue (the Worldtree's pale silver-jade leaves, from the same green atlas)
-export function foliageMaterial(glowColor = null, map = null, recolor = false, wind = 1) {
+// selfGlow: at night the leaves glow in their own colour (the otherworldly kit's filaments
+// and beads), with only a touch of the world's glow colour
+export function foliageMaterial(glowColor = null, map = null, recolor = false, wind = 1, selfGlow = false) {
     const m = glowMaterial({ roughness: 0.85, map: map || textures().tree, alphaTest: 0.5, side: THREE.DoubleSide, alphaToCoverage: !!map }, glowColor);
     const base = m.onBeforeCompile;
     m.onBeforeCompile = (sh, r) => {
         base(sh, r);
+        if (selfGlow) sh.fragmentShader = sh.fragmentShader.replace("totalEmissiveRadiance += uGlowColor * vGlow *",
+            "totalEmissiveRadiance += (diffuseColor.rgb * 1.5 + uGlowColor * 0.1) * vGlow *");
         if (recolor) sh.fragmentShader = sh.fragmentShader.replace("#include <map_fragment>", `#include <map_fragment>
-            diffuseColor.rgb = vec3(pow(dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11)) * 3.2, 0.85));`);
+            diffuseColor.rgb = vec3(pow(dot(diffuseColor.rgb, vec3(0.3, 0.59, 0.11)) * ${typeof recolor === "number" ? recolor.toFixed(2) : "3.2"}, 0.85));`);
         // Leaves are thin: sunlight passes through them. Looking toward the sun through a
         // canopy, the leaves glow a deeper, warmer colour (forward scattering), and the
         // side of a clump facing away from the sun still picks up light through the leaves.
@@ -393,13 +397,16 @@ export function foliageMaterial(glowColor = null, map = null, recolor = false, w
             #endif
             #include <alphatest_fragment>`);
     };
-    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "") + (recolor ? "rc" : "") + "sss";
+    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "") + (recolor ? "rc" + recolor : "") + (selfGlow ? "self" : "") + "sss";
     return addWind(m, wind, map ? "all" : true);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
 // cells of the Blender leaves atlas (tex/leaves.png, glTF uvs): [u0, v at the card's bottom, u1, v at its top]
 export const ATLAS_BROADLEAF = [0.004, 0.496, 0.496, 0.004];
 export const ATLAS_HANGING = [0.004, 0.504, 0.496, 0.996];   // weeping frond, hanging from its top edge
+// cells of the otherworldly atlas (tex/alien.png): sword-leaf fan, plume, and the filament
+// curtain, which hangs from the top edge of its cell (card top = attach point)
+export const ALIEN_FAN = [0.004, 0.496, 0.496, 0.004], ALIEN_PLUME = [0.504, 0.496, 0.996, 0.004], ALIEN_FILAMENT = [0.004, 0.996, 0.496, 0.504];
 
 // Build one non-indexed geometry from parts, each with a flat colour and glow
 export function buildParts(parts) {

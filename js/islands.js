@@ -216,8 +216,22 @@ const BROADLEAF_TINTS = [
     [[0.55, 0.66, 0.32], 1.5], [[1.4, 0.88, 0.26], 0.6], [[1.35, 0.5, 0.26], 0.4], [[0.95, 0.92, 0.88], 0.45],
 ];
 const CONIFER_TINTS = [[[0.38, 0.56, 0.52], 3], [[0.3, 0.44, 0.38], 2], [[0.55, 0.66, 0.5], 1], [[0.46, 0.56, 0.66], 0.8]];
-function leafTint(ty, x, z, seed, rand) {
-    const list = ty ? CONIFER_TINTS : BROADLEAF_TINTS;
+// the otherworldly kit (tex/alien.png is pale, so these set each species' hue):
+// canopy 1 Parasol, 2 Veilwillow, 3 Cloudpad; spire 1 Corkscrew, 2 Lantern fir, 3 Bellcap
+const KIT_TINTS = {
+    canopy: [
+        [[[1.3, 0.55, 0.5], 2], [[1.35, 0.9, 0.45], 2], [[0.7, 1.08, 0.95], 2], [[1.05, 0.72, 1.25], 1], [[0.62, 1.0, 0.72], 1.5]],
+        [[[0.82, 1.06, 1.22], 3], [[1.12, 0.82, 1.28], 2], [[0.72, 1.18, 1.0], 1.5], [[1.22, 0.98, 0.8], 0.7]],
+        [[[1.28, 0.8, 0.95], 2], [[0.95, 1.18, 0.8], 2], [[1.32, 1.1, 0.6], 1.5], [[0.82, 0.92, 1.28], 1]],
+    ],
+    spire: [
+        [[[1.0, 1.0, 1.0], 2], [[0.75, 1.15, 1.22], 2], [[1.28, 0.85, 0.8], 1.5], [[1.12, 1.1, 0.7], 1]],
+        [[[0.7, 1.12, 1.02], 2], [[0.85, 0.96, 1.28], 2], [[0.62, 1.04, 0.72], 1.5], [[1.22, 0.9, 1.12], 1]],
+        [[[1.0, 1.0, 1.12], 2], [[1.16, 0.86, 1.22], 2], [[0.8, 1.12, 1.22], 2], [[1.28, 1.06, 0.75], 1]],
+    ],
+};
+function leafTint(ty, x, z, seed, rand, v = -1) {
+    const list = v >= 0 ? KIT_TINTS[ty ? "spire" : "canopy"][v % 3] : ty ? CONIFER_TINTS : BROADLEAF_TINTS;
     const pick = (u) => {
         let total = 0;
         for (const [, w] of list) total += w;
@@ -244,7 +258,7 @@ class Vegetation {
         this.glowMat = addWind(glowMaterial({ roughness: 0.8 }, "#ff9a5a"), 0.5, false);
         this.vineMat = addWind(glowMaterial({ roughness: 0.85, map: textures().bark }, "#9b7cff"), 1, false);
         if (kit) {
-            this.leafMat = foliageMaterial(null, textures().leaves);
+            this.leafMat = foliageMaterial(null, textures().alien, false, 1, true);
             this.barkMat = addWind(glowMaterial({ roughness: 0.9, map: textures().bark }), 1, false);
             // flowers that burst open on the near trees as the dragon passes (blossoms.js)
             addBlossoms(kit);
@@ -286,7 +300,7 @@ class Vegetation {
             const key = ty * 10 + Math.min(variants - 1, Math.floor(rand() * variants));
             if (!sets.has(key)) sets.set(key, []);
             const list = sets.get(key);
-            const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length, c: ty < 2 ? leafTint(ty, trees[i], trees[i + 2], e.seed || 3, tintRand) : null };
+            const tree = { m: m4.compose(p, q, s).clone(), key, index: list.length, c: ty < 2 ? leafTint(ty, trees[i], trees[i + 2], e.seed || 3, tintRand, this.kit ? key % 10 : -1) : null };
             list.push(tree);
             if (this.kit && ty < 2) {
                 const ck = Math.floor(trees[i] / this.CHUNK) + "," + Math.floor(trees[i + 2] / this.CHUNK);

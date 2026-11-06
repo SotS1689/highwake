@@ -795,6 +795,19 @@ export class Game {
             crown: () => [[1500, 4300, 1500], [-0.6, 0.45, -0.6]],
             below: () => [[5200, 2600, 5200], [0.55, -0.6, 0.55]],
             vista: () => [[-6000, 5200, 6000], [0.75, -0.18, -0.6]],
+            // close by a forest patch (?shot=forest&n=3 picks another patch), for judging trees
+            forest: () => {
+                const n = +(new URLSearchParams(location.search).get("n") || 0);
+                // patches near an island's rim, seen from out in the air beyond it
+                const all = this.veg.groups.flatMap((g) => g.chunks.map((c) => ({ c, e: g.e })))
+                    .filter(({ c, e }) => c.trees.length > 6 && Math.hypot(c.center.x - e.pos[0], c.center.z - e.pos[2]) > (e.r || 300) * 0.55)
+                    .sort((a, b) => b.c.trees.length - a.c.trees.length);
+                const { c: ch, e } = all[n % all.length];
+                const c = ch.center;
+                const out = new THREE.Vector3(c.x - e.pos[0], 0, c.z - e.pos[2]).normalize();
+                const p = c.clone().addScaledVector(out, 230).add(new THREE.Vector3(0, 60, 0));
+                return [p.toArray(), c.clone().add(new THREE.Vector3(0, 25, 0)).sub(p).normalize().toArray()];
+            },
         };
         this.settings.time = time || "golden";
         this.applySettings();

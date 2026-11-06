@@ -158,7 +158,8 @@ export function blossomMaterial() {
 // Add a blossom geometry to every variant of the tree kit
 export function addBlossoms(kit) {
     let seed = 1;
-    for (const [sp, n] of [["canopy", 30], ["spire", 16]]) {
+    // fewer than on the old green trees: the otherworldly crowns are colourful already
+    for (const [sp, n] of [["canopy", 14], ["spire", 8]]) {
         for (const v of kit[sp]) v.blossom = blossomGeometry(v.leaves, n, 97 * seed++);
     }
 }
