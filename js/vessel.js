@@ -22,6 +22,14 @@ export class Input {
             if (e.repeat) return;
             this.keys.add(e.code);
             this.pressed.add(e.code);
+            // double-tap A or D: a full barrel roll that way
+            if (e.code === "KeyA" || e.code === "KeyD") {
+                const now = performance.now();
+                if (this._lastTap?.code === e.code && now - this._lastTap.t < 300) {
+                    this.pressed.add(e.code === "KeyD" ? "RollRight" : "RollLeft");
+                    this._lastTap = null;
+                } else this._lastTap = { code: e.code, t: now };
+            }
             if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code) && this.locked) e.preventDefault();
         });
         addEventListener("keyup", (e) => this.keys.delete(e.code));
@@ -121,7 +129,7 @@ export class Vessel {
         this.q.setFromRotationMatrix(m);
         this.vdir.copy(f);
         this.speed = 70;
-        this.hover = 0; this.hoverClimb = 0;
+        this.hover = 0; this.hoverClimb = 0; this.barrel = null;
         this.rates.set(0, 0, 0);
         this.extVel.set(0, 0, 0);
         this._axes();
@@ -153,8 +161,13 @@ export class Vessel {
         // hold the bank through steep flight and while the stick is pulled hard, so a
         // held pull carries you over the top in a full loop instead of rolling upright
         const loopish = steep > 0.72 || (Math.abs(inp.stickY) > 0.6 && Math.abs(inp.stickX) < 0.3);
+        if (!this.barrel && hv < 0.5) {
+            if (inp.pressed.has("RollRight")) this.barrel = { dir: 1, left: Math.PI * 2 };
+            else if (inp.pressed.has("RollLeft")) this.barrel = { dir: -1, left: Math.PI * 2 };
+        }
         let roll;
-        if (inp.roll !== 0) roll = inp.roll * 3.2;
+        if (this.barrel) roll = this.barrel.dir * 7.5;
+        else if (inp.roll !== 0) roll = inp.roll * 3.2;
         else {
             const target = loopish ? this.bank : inp.stickX * 0.8;
             const levelPull = settings.autolevel || Math.abs(inp.stickX) > 0.05 ? 2.6 : 0;
@@ -168,7 +181,11 @@ export class Vessel {
         const k = Math.min(1, dt * 7);
         this.rates.x += (pitch - this.rates.x) * k;
         this.rates.y += (yaw - this.rates.y) * k;
-        this.rates.z += (roll - this.rates.z) * k;
+        this.rates.z += (roll - this.rates.z) * (this.barrel ? Math.min(1, dt * 14) : k);
+        if (this.barrel) {
+            this.barrel.left -= Math.abs(this.rates.z) * dt;
+            if (this.barrel.left <= 0.15) this.barrel = null;
+        }
         this.avel = this.rates;
 
         const yawAxis = UP.clone().lerp(this.up, THREE.MathUtils.smoothstep(steep, 0.55, 0.85)).normalize();
