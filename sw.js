@@ -1,7 +1,7 @@
 // Offline support: cache the game shell and the three.js modules it loads.
 // Bump CACHE whenever files change so installed copies update.
 
-const CACHE = "highwake-v20";
+const CACHE = "highwake-v21";
 const SHELL = [
     "./", "index.html", "css/style.css", "manifest.webmanifest",
     "js/main.js", "js/game.js", "js/world.js", "js/noise.js", "js/gfx.js", "js/sky.js", "js/islands.js",

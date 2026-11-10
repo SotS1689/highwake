@@ -162,8 +162,8 @@ export class Vessel {
         // held pull carries you over the top in a full loop instead of rolling upright
         const loopish = steep > 0.72 || (Math.abs(inp.stickY) > 0.6 && Math.abs(inp.stickX) < 0.3);
         if (!this.barrel && hv < 0.5) {
-            if (inp.pressed.has("RollRight")) this.barrel = { dir: 1, left: Math.PI * 2 };
-            else if (inp.pressed.has("RollLeft")) this.barrel = { dir: -1, left: Math.PI * 2 };
+            if (inp.pressed.has("RollRight")) this.barrel = { dir: 1, left: Math.PI * 2, up: this.up.clone() };
+            else if (inp.pressed.has("RollLeft")) this.barrel = { dir: -1, left: Math.PI * 2, up: this.up.clone() };
         }
         let roll;
         if (this.barrel) roll = this.barrel.dir * 7.5;
@@ -403,7 +403,10 @@ export class ChaseCamera {
 
     update(v, dt, settings, sdf) {
         const m = this.modes[this.mode];
-        const want = v.pos.clone().addScaledVector(v.vdir, -m.d).addScaledVector(v.up, m.h);
+        // during a double-tap barrel roll the camera ignores the roll: it keeps the
+        // dragon's "up" from the moment the roll began
+        const vUp = v.barrel ? v.barrel.up : v.up;
+        const want = v.pos.clone().addScaledVector(v.vdir, -m.d).addScaledVector(vUp, m.h);
         const k = 1 - Math.exp(-dt * (this.mode === 2 ? 2.5 : 6));
         this.pos.lerp(want, k);
         // keep the camera out of rock
@@ -412,7 +415,7 @@ export class ChaseCamera {
         }
         const steep = Math.abs(v.fwd.y);
         const upWant = settings.camroll ? v.up.clone() : UP.clone().lerp(v.up, THREE.MathUtils.smoothstep(steep, 0.6, 0.9) + (v.up.y < 0 ? 1 : 0)).normalize();
-        this.up.lerp(upWant, 1 - Math.exp(-dt * 4)).normalize();
+        if (!v.barrel) this.up.lerp(upWant, 1 - Math.exp(-dt * 4)).normalize();
         // (hovering, look along the heading rather than up the raised nose)
         const look = v.pos.clone().addScaledVector(v.hover > 0 ? v.fwd.clone().lerp(v.vdir, v.hover) : v.fwd, 40);
         this.cam.position.copy(this.pos);
