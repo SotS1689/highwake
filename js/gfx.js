@@ -22,6 +22,10 @@ export const shared = {
     uBeatPos: { value: new THREE.Vector3(0, -1e6, 0) },
     uBeatAge: { value: 99 },
     uBeatAmp: { value: 0 },
+    // Texture sharpness. With frames being blended (post.js) the textures can be read from
+    // a sharper copy than usual without shimmering: the blending settles the extra detail.
+    // Game sets it lower still when the scene is drawn smaller than the screen.
+    uLodBias: { value: -0.5 },
 };
 
 // Push (in metres, world space) that the dragon's air gives a plant at world point wp:
@@ -178,7 +182,7 @@ export function textures() {
         const t = L.load(new URL(`../tex/${f}`, import.meta.url).href, done, undefined, done);
         t.wrapS = t.wrapT = THREE.RepeatWrapping;
         t.colorSpace = color ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-        t.anisotropy = 8;
+        t.anisotropy = 4;
         return t;
     };
     TEX = {
@@ -200,14 +204,36 @@ export function texturesReady() {
 // art-directed vertex colours keep their hue and the photo adds the grain.
 const DETAIL_GLSL = `
     uniform sampler2D tCliff, tCliffN, tRock, tGrass, tGrassN, tBark;
+    uniform float uLodBias;
     varying vec3 vNW;
-    vec3 triC(sampler2D t, vec3 p, vec3 w, float s){ return texture2D(t, p.zy*s).rgb*w.x + texture2D(t, p.xz*s).rgb*w.y + texture2D(t, p.xy*s).rgb*w.z; }
+    // The texture is projected along each of the three axes and blended by how much the
+    // surface faces that axis. Most pixels face one axis almost entirely (flat ground, a
+    // sheer wall), so projections that would add under 5% are skipped: about a third of
+    // the lookups for the same picture. This shader covers more of the screen than any
+    // other, so it was the dearest thing per pixel on integrated graphics.
+    // gx, gy: how the world position changes across the screen, measured once up front
+    // (the graphics card can't work that out inside a skipped branch).
+    vec3 gX, gY;
+    vec3 triC2(sampler2D t, vec3 p, vec3 w, float s, vec3 gx, vec3 gy){
+        float k = s * exp2(uLodBias);
+        vec3 dx = gx * k, dy = gy * k, c = vec3(0.0); float n = 0.0;
+        if (w.x > 0.05) { c += textureGrad(t, p.zy*s, dx.zy, dy.zy).rgb * w.x; n += w.x; }
+        if (w.y > 0.05) { c += textureGrad(t, p.xz*s, dx.xz, dy.xz).rgb * w.y; n += w.y; }
+        if (w.z > 0.05) { c += textureGrad(t, p.xy*s, dx.xy, dy.xy).rgb * w.z; n += w.z; }
+        return c / max(n, 1e-3);
+    }
+    #define triC(t, p, w, s) triC2(t, p, w, s, gX, gY)
     vec3 triN(sampler2D t, vec3 p, vec3 w, float s){
-        vec3 a = texture2D(t, p.zy*s).xyz*2.-1., b = texture2D(t, p.xz*s).xyz*2.-1., c = texture2D(t, p.xy*s).xyz*2.-1.;
-        return vec3(0., a.y, a.x)*w.x + vec3(b.x, 0., b.y)*w.y + vec3(c.x, c.y, 0.)*w.z;
+        float k = s * exp2(uLodBias);
+        vec3 dx = gX * k, dy = gY * k, r = vec3(0.0);
+        if (w.x > 0.05) { vec3 a = textureGrad(t, p.zy*s, dx.zy, dy.zy).xyz*2.-1.; r += vec3(0., a.y, a.x)*w.x; }
+        if (w.y > 0.05) { vec3 b = textureGrad(t, p.xz*s, dx.xz, dy.xz).xyz*2.-1.; r += vec3(b.x, 0., b.y)*w.y; }
+        if (w.z > 0.05) { vec3 c = textureGrad(t, p.xy*s, dx.xy, dy.xy).xyz*2.-1.; r += vec3(c.x, c.y, 0.)*w.z; }
+        return r;
     }
 `;
 const DETAIL_COLOR = `
+    gX = dFdx(vVW); gY = dFdy(vVW);
     vec3 nW = normalize(vNW);
     vec3 bw = pow(abs(nW), vec3(4.0)); bw /= (bw.x + bw.y + bw.z);
     float grassW = smoothstep(0.008, 0.05, vColor.g - vColor.r);
@@ -228,8 +254,8 @@ const DETAIL_COLOR = `
         vec3 wp = vVW + (vec3(nA, 1.0 - nA, nB) - 0.5) * vec3(16.0, 11.0, 16.0) + vec3(nB * 23.0, 0.0, -nB * 17.0);
         vec3 rp = vec3(0.788 * vVW.x - 0.616 * vVW.z, vVW.y * 0.93 + nA * 9.0, 0.616 * vVW.x + 0.788 * vVW.z);
         float mixK = 0.35 + 0.4 * smoothstep(0.2, 0.8, nB + (nA - 0.5) * 0.3);
-        cd = (triC(tCliff, wp, bw, 1.0/9.0) * (1.0 - mixK) + triC(tCliff, rp, bw, 1.0/53.0) * mixK) / vec3(0.19, 0.179, 0.135);
-        if (nW.y < -0.15) cd = mix(cd, triC(tRock, wp.zyx, bw.zyx, 1.0/16.0) / vec3(0.084, 0.0785, 0.066), smoothstep(-0.15, -0.6, nW.y));
+        cd = (triC(tCliff, wp, bw, 1.0/9.0) * (1.0 - mixK) + triC2(tCliff, rp, bw, 1.0/53.0, vec3(0.788 * gX.x - 0.616 * gX.z, gX.y * 0.93, 0.616 * gX.x + 0.788 * gX.z), vec3(0.788 * gY.x - 0.616 * gY.z, gY.y * 0.93, 0.616 * gY.x + 0.788 * gY.z)) * mixK) / vec3(0.19, 0.179, 0.135);
+        if (nW.y < -0.15) cd = mix(cd, triC2(tRock, wp.zyx, bw.zyx, 1.0/16.0, gX.zyx, gY.zyx) / vec3(0.084, 0.0785, 0.066), smoothstep(-0.15, -0.6, nW.y));
         pert += triN(tCliffN, wp, bw, 1.0/9.0) * (1.0 - grassW) * 0.9;
         // rock beds: irregular bands from noise stretched sideways (no fixed spacing, so
         // they never read as ruled lines), tilting and pinching out across the face, and
@@ -288,7 +314,7 @@ export function glowMaterial(opts = {}, glowColor = null, veins = false, detail 
         }
         if (detail) {
             const T = textures();
-            Object.assign(sh.uniforms, { tCliff: { value: T.cliff }, tCliffN: { value: T.cliffN }, tRock: { value: T.rock }, tGrass: { value: T.grass }, tGrassN: { value: T.grassN }, tBark: { value: T.bark } });
+            Object.assign(sh.uniforms, { uLodBias: shared.uLodBias, tCliff: { value: T.cliff }, tCliffN: { value: T.cliffN }, tRock: { value: T.rock }, tGrass: { value: T.grass }, tGrassN: { value: T.grassN }, tBark: { value: T.bark } });
             if (detail === "bark") sh.fragmentShader = "#define BARK\n" + sh.fragmentShader;
             sh.vertexShader = sh.vertexShader
                 .replace("varying vec3 vVW;", "varying vec3 vVW;\nvarying vec3 vNW;")
@@ -299,7 +325,7 @@ export function glowMaterial(opts = {}, glowColor = null, veins = false, detail 
                 .replace("#include <normal_fragment_maps>", "#include <normal_fragment_maps>\nnormal = normalize((viewMatrix * vec4(normalize(nW + pert), 0.0)).xyz);");
         }
     };
-    m.customProgramCacheKey = () => "glow" + (glowColor || "") + (veins ? "v" : "") + (detail ? "d" + detail : "");
+    m.customProgramCacheKey = () => "glow" + (glowColor || "") + (veins ? "v" : "") + (detail ? "d3" + detail : "");
     return m;
 }
 
@@ -421,6 +447,29 @@ export function foliageMaterial(glowColor = null, map = null, recolor = false, w
                 totalEmissiveRadiance += tint * uSunColor * (fwd * 2.0 + back * 0.5) * day;
             }`);
         sh.fragmentShader = sh.fragmentShader.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace(/normal \*= faceDirection;/g, ""));
+        // Painted depth: a crown is lightest on top and darkest underneath and inside (the
+        // leaf normals point out from the middle of the crown, so their tilt says where on
+        // the crown a leaf sits). No shadows are cast inside a tree, so this gradient is
+        // what makes each one read as a rounded mass instead of flat confetti.
+        sh.vertexShader = sh.vertexShader
+            .replace("#include <common>", "#include <common>\nvarying float vShade;")
+            .replace("#include <begin_vertex>", "#include <begin_vertex>\nvShade = mix(0.42, 1.14, smoothstep(-0.75, 0.7, normalize(objectNormal).y));");
+        sh.fragmentShader = sh.fragmentShader
+            .replace("#include <common>", "#include <common>\nvarying float vShade;")
+            .replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor.rgb *= vShade;");
+        // Far away, read the leaf picture a step or two blurrier than the graphics card
+        // would choose: the speckle of single leaves melts into soft masses of colour,
+        // the way distant forest is painted (and nothing is left to shimmer).
+        // Leaves sway and flutter every frame, and the frame blending (TAAPass in post.js)
+        // only knows how the camera moved, not the wind: blended like everything else,
+        // foliage turned to mush. So leaves mark their pixels (alpha 0 in the scene image)
+        // and the blending keeps mostly the new frame there.
+        sh.fragmentShader = sh.fragmentShader.replace("#include <dithering_fragment>", "#include <dithering_fragment>\ngl_FragColor.a = 0.0;");
+        // Near by it is the other way round: a sharper copy than usual (see uLodBias).
+        sh.uniforms.uLodBias = shared.uLodBias;
+        if (map) sh.fragmentShader = sh.fragmentShader.replace("#include <common>", "#include <common>\nuniform float uLodBias;").replace("#include <map_fragment>",
+            "float uvBias = mix(uLodBias, 1.3, smoothstep(700.0, 2600.0, length(vViewPosition)));\n"
+            + THREE.ShaderChunk.map_fragment.replace("texture2D( map, vMapUv )", "texture2D( map, vMapUv, uvBias )"));
         // Blender atlases have soft, antialiased alpha: the alpha test then gives a
         // crisp edge at any magnification (sharpened to one pixel by three's
         // alpha-to-coverage path). Mipmapping averages alpha down, which would thin
@@ -431,7 +480,7 @@ export function foliageMaterial(glowColor = null, map = null, recolor = false, w
                 vec2 ts = vec2(textureSize(map, 0));
                 vec2 ddx = dFdx(vMapUv * ts), ddy = dFdy(vMapUv * ts);
                 float lod = 0.5 * log2(max(max(dot(ddx, ddx), dot(ddy, ddy)), 1e-8));
-                diffuseColor.a *= 1.0 + max(lod, 0.0) * 0.25;
+                diffuseColor.a *= 1.0 + max(lod + uvBias, 0.0) * 0.25;
                 // a card seen edge-on smears its texture into streaks: fade it out as it
                 // turns away (its real face, from screen-space derivatives)
                 vec3 fn = normalize(cross(dFdx(vViewPosition), dFdy(vViewPosition)));
@@ -441,7 +490,7 @@ export function foliageMaterial(glowColor = null, map = null, recolor = false, w
             #endif
             #include <alphatest_fragment>`);
     };
-    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "") + (recolor ? "rc" + recolor : "") + (selfGlow ? "self" : "") + "sss";
+    m.customProgramCacheKey = () => "foliage" + (glowColor || "") + (map ? "atlas3" : "") + (recolor ? "rc" + recolor : "") + (selfGlow ? "self" : "") + "sss-shade3";
     return addWind(m, wind, map ? "all" : true);
 }
 export const UV_BARK = [0.02, 0.0, 0.48, 1.0], UV_LEAVES = [0.5, 0.0, 1.0, 1.0];
@@ -452,9 +501,11 @@ export const ATLAS_HANGING = [0.004, 0.504, 0.496, 0.996];   // weeping frond, h
 // curtain, which hangs from the top edge of its cell (card top = attach point)
 export const ALIEN_FAN = [0.004, 0.496, 0.496, 0.004], ALIEN_PLUME = [0.504, 0.496, 0.996, 0.004], ALIEN_FILAMENT = [0.004, 0.996, 0.496, 0.504];
 
-// Build one non-indexed geometry from parts, each with a flat colour and glow
+// Build one geometry from parts, each with a flat colour and glow. Parts that share
+// corners between triangles (tubes, cards, spheres) keep sharing them, so the graphics
+// card works each corner out once instead of once per triangle (3 to 6 times less work).
 export function buildParts(parts) {
-    const pos = [], nrm = [], col = [], glw = [], uvs = [], stems = [], phases = [];
+    const pos = [], nrm = [], col = [], glw = [], uvs = [], stems = [], phases = [], idx = [];
     const c = new THREE.Color();
     // stem: [x, y, z] where a leaf card attaches (it then swings on it in the wind shader,
     // material.userData.cards); phase: its own 0..1 rhythm
@@ -464,8 +515,10 @@ export function buildParts(parts) {
         let g = p.geo.clone();
         if (p.matrix) g.applyMatrix4(p.matrix);
         if (!p.keepNormals || !g.attributes.normal) g.computeVertexNormals();
-        if (g.index) g = g.toNonIndexed();
         const P = g.attributes.position, N = g.attributes.normal, U = g.attributes.uv;
+        const v0 = pos.length / 3;
+        if (g.index) { const I = g.index.array; for (let i = 0; i < I.length; i++) idx.push(v0 + I[i]); }
+        else for (let i = 0; i < P.count; i++) idx.push(v0 + i);
         const r = p.uvRect || [0, 0, 1, 1];
         c.set(p.color);
         const cl = p.collar;   // { a, d, r }: a branch growing out of a parent (axis point, direction, radius)
@@ -507,6 +560,7 @@ export function buildParts(parts) {
         geo.setAttribute("aStem", new THREE.Float32BufferAttribute(stems, 3));
         geo.setAttribute("aPhase", new THREE.Float32BufferAttribute(phases, 1));
     }
+    geo.setIndex(idx);
     geo.computeBoundingSphere();
     return geo;
 }

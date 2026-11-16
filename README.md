@@ -57,10 +57,17 @@ Push the folder to a GitHub repo under SotS1689 and turn on GitHub Pages. The li
 - `js/land.js`: draws that land with water glints, cloud shadows and haze.
 - `js/sky.js`: sky dome, sun, moon, stars, aurora, the broken cloud deck, billboard clouds, horizon giants and the day/night cycle.
 - `js/volclouds.js`: the volumetric sea of clouds and low haze (a post pass that raymarches the deck using the scene's depth).
-- `js/cinematic.js`: sun shafts and the time-of-day colour grade.
+- `js/cinematic.js`: sun shafts, and the settings for the time-of-day colour grade (`js/post.js` applies it).
+- `js/post.js`: the post-processing chain, with one full-screen final pass that adds clouds, haze, sun shafts and bloom, then tone mapping and the colour grade.
+- `js/gfx.js`: shared shader pieces and materials: global uniforms, wind (`addWind`), the foliage and glow materials, island shadows and the dragon's air that pushes plants aside.
+- `js/blossoms.js`: flowers on the near trees that burst open as the dragon flies close and fold away after it passes.
+- `js/motes.js`: pollen and seed fluff drifting in the air near the islands (glowing faintly at night).
+- `js/noise.js`: seeded simplex noise and random numbers (no three.js, so the mesher worker can use it).
 - `js/dragonModel.js`: loads the Blender-built dragon (`models/dragon.glb`) and drives its animations; `js/dragon.js` is the code-built fallback and owns the skin shader.
 - `tools/blender/`: Blender scripts that build `models/dragon.glb` and `models/creatures.glb` (see `docs/graphics-roadmap.md`). `?dragon=classic` uses the code-built dragon and creatures.
-- `js/game.js`: renderer and bloom, the frame loop, collisions, puzzles, achievements and saving.
+- `models/rocks.glb` and `models/trees.glb`: the rock and tree kits, built by `tools/blender/build_rocks.py` and `build_trees.py` (which also renders the leaf atlases in `tex/`). `?trees=classic` uses the old code-built trees.
+- `tools/make_bark_normal.py`: makes the bark normal map `tex/bark_n.jpg` from the bark photo.
+- `js/game.js`: renderer, the frame loop, collisions, puzzles, achievements and saving.
 - `js/audio.js`: synthesized wind, score, whale song, chimes, bell and thunder (no audio files).
 - `js/main.js`: title screen, HUD, journal and map, settings, theme, install, analytics and the support callout.
 

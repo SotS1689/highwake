@@ -106,7 +106,10 @@ export function meshEntity(e) {
     const eps = c * 0.6;
     const nz2 = e.noise;
     const H = e.h || 100;
-    const treeChance = (e.trees || 0) * (c * c) / (30 * 30);
+    // a quarter as many trees as there used to be, each about a third larger: open
+    // woodland of big trees, and the drawing time saved goes into each tree and into a
+    // sharper picture
+    const treeChance = 0.25 * (e.trees || 0) * (c * c) / (30 * 30);
     const vineChance = (c * c) / (32 * 32);
     const isBridge = e.kind === "bridge";
 
@@ -154,7 +157,7 @@ export function meshEntity(e) {
 
         if (!isBridge && gy > 0.84 && rand() < treeChance) {
             const forest = nz2.noise3(x * 0.0022 + 9, z * 0.0022, 3);
-            if (forest > -0.25) trees.push(x, y, z, 0.7 + rand() * 0.7, rand());
+            if (forest > -0.25) trees.push(x, y, z, 1.0 + rand() * 0.8, rand());
         }
         if (gy < -0.55 && rand() < vineChance && vines.length < 1800 * 4) vines.push(x, y, z, 0.4 + rand() * rand() * 1.8);
     }

@@ -171,6 +171,39 @@ export async function buildIslands(scene, entities, onProgress) {
         }
     });
 
+    // Painted shade under the trees. Nothing casts real shadows on the islands (far too
+    // dear for this many trees), so the ground under each crown is darkened once, here,
+    // in the island's own colours: it costs nothing while flying, and it is what roots a
+    // tree to the ground instead of leaving it standing on an evenly lit lawn.
+    const shadeUnderTrees = (r, trees, small) => {
+        if (!trees || !trees.length) return;
+        const G = 48, grid = new Map();
+        for (let i = 0; i < trees.length; i += 5) {
+            const k = Math.floor(trees[i] / G) + "," + Math.floor(trees[i + 2] / G);
+            if (!grid.has(k)) grid.set(k, []);
+            grid.get(k).push(i);
+        }
+        const P = r.position, N = r.normal, C = r.color;
+        for (let v = 0; v < P.length / 3; v++) {
+            if (N[v * 3 + 1] < 0.35) continue;
+            const x = P[v * 3], y = P[v * 3 + 1], z = P[v * 3 + 2];
+            const gx = Math.floor(x / G), gz = Math.floor(z / G);
+            let dark = 0;
+            for (let a = gx - 1; a <= gx + 1; a++) for (let b = gz - 1; b <= gz + 1; b++) {
+                const list = grid.get(a + "," + b);
+                if (!list) continue;
+                for (const i of list) {
+                    if (Math.abs(trees[i + 1] - y) > 45) continue;
+                    const R = 34 * trees[i + 3] * (small ? 0.7 : 1), d = Math.hypot(trees[i] - x, trees[i + 2] - z);
+                    if (d < R) { const f = 1 - d / R; dark += f * f * (3 - 2 * f) * 0.6; }
+                }
+            }
+            if (!dark) continue;
+            const k = 1 - Math.min(0.62, dark);
+            // a touch cooler as well as darker, like shade under an open sky
+            C[v * 3] *= k * 0.94; C[v * 3 + 1] *= k * 0.98; C[v * 3 + 2] *= k * 1.04;
+        }
+    };
     const toGeo = (r) => {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
@@ -187,6 +220,8 @@ export async function buildIslands(scene, entities, onProgress) {
     const farGeos = new Array(entities.length);
     for (let i = 0; i < entities.length; i++) {
         const e = entities[i], r = results[i];
+        shadeUnderTrees(r, r.trees, e.small);
+        if (coarse[i] && coarse[i].index.length > 0) shadeUnderTrees(coarse[i], r.trees, e.small);
         const m = new THREE.Mesh(toGeo(r), mat);
         const lo = coarse[i] && coarse[i].index.length > 0 ? new THREE.Mesh(toGeo(coarse[i]), mat) : null;
         // switch to the coarse copy once the island is small on screen
@@ -208,6 +243,62 @@ export async function buildIslands(scene, entities, onProgress) {
     veg.ground?.finish();
     const falls = new Waterfalls(scene, entities);
     return { meshes, farGeos, veg, falls };
+}
+
+// ---------------------------------------------------------------------------------
+// Detailed copies only where the camera is. An island's vines (or rocks) are all drawn
+// as light far copies in a few instanced meshes; the island is also cut into cells, and
+// a cell near the camera gets detailed copies of just its own things, while their far
+// copies are shrunk to nothing. (Before, coming near an island switched every vine and
+// rock on it to full detail at once: millions of triangles, most of them out of sight.)
+class NearSwap {
+    constructor(scene, size) {
+        this.scene = scene;
+        this.size = size;
+        this.cells = [];
+    }
+
+    // items: [{ m: Matrix4, c: Color or null }] in the same order as the instances of the
+    // far meshes lo; hi: [[geometry, material], ...] to build for a cell near the camera
+    add(items, lo, hi) {
+        const S = this.size, map = new Map(), p = new THREE.Vector3();
+        items.forEach((it, i) => {
+            p.setFromMatrixPosition(it.m);
+            const k = Math.floor(p.x / S) + "," + Math.floor(p.y / S) + "," + Math.floor(p.z / S);
+            let c = map.get(k);
+            if (!c) map.set(k, (c = { items: [], idx: [], center: new THREE.Vector3(), r: 0, on: false, meshes: null, lo, hi }));
+            c.items.push(it); c.idx.push(i); c.center.add(p);
+        });
+        for (const c of map.values()) {
+            c.center.multiplyScalar(1 / c.items.length);
+            for (const it of c.items) c.r = Math.max(c.r, c.center.distanceTo(p.setFromMatrixPosition(it.m)));
+            this.cells.push(c);
+        }
+    }
+
+    update(cam, range) {
+        let built = 0;
+        for (const c of this.cells) {
+            const want = c.lo[0].visible && c.center.distanceTo(cam) - c.r < range * (c.on ? 1.15 : 1);
+            if (want === c.on) continue;
+            if (want && !c.meshes) {
+                if (built++ >= 4) continue;      // a few new cells a frame, so nothing stalls
+                c.meshes = c.hi.map(([geo, mat]) => {
+                    const im = new THREE.InstancedMesh(geo, mat, c.items.length);
+                    c.items.forEach((it, j) => { im.setMatrixAt(j, it.m); if (it.c) im.setColorAt(j, it.c); });
+                    im.computeBoundingSphere();
+                    this.scene.add(im);
+                    return im;
+                });
+            }
+            c.on = want;
+            for (const m of c.meshes) m.visible = want;
+            for (const im of c.lo) {
+                c.idx.forEach((i, j) => im.setMatrixAt(i, want ? ZERO : c.items[j].m));
+                im.instanceMatrix.needsUpdate = true;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -335,7 +426,8 @@ function leafTint(ty, x, z, seed, rand, v = -1) {
     };
     // a patch value that changes slowly across the island
     const patch = 0.5 + 0.5 * Math.sin(x * 0.006 + seed * 1.7) * Math.sin(z * 0.0071 - seed * 0.9);
-    const c = pick(rand() < 0.6 ? patch : rand());
+    // (mostly the patch's colour: from afar, single odd-coloured trees read as noise)
+    const c = pick(rand() < 0.85 ? patch : rand());
     const b = 0.9 + rand() * 0.2;
     return new THREE.Color(c[0] * b, c[1] * b, c[2] * b);
 }
@@ -373,6 +465,9 @@ class Vegetation {
         this.groups = [];
         this.hiRange = 600;      // set from the quality level
         this.groundRange = 300;  // ground cover (0: none)
+        this.vineHi = 500;       // detailed vines within this distance of the camera
+        this.hiTrees = 340;      // at most this many detailed trees at once (the nearest)
+        this.vineSwap = new NearSwap(scene, 200);
         this.ground = kit ? new Ground(scene) : null;
         this.CHUNK = 190;        // forest patch size for the near trees (small, so only close trees get full detail)
     }
@@ -444,12 +539,13 @@ class Vegetation {
             s.setScalar(Math.max(0.35, len / this.geos.vines[vi].L));
             byVariant[vi].push(m4.compose(p, q, s).clone());
         }
-        group.vinesHi = []; group.vinesLo = [];
+        group.vinesLo = [];
         byVariant.forEach((list, vi) => {
             if (!list.length) return;
-            for (const [V, out] of [[this.geos.vines[vi], group.vinesHi], [this.geos.vinesLo[vi], group.vinesLo]]) {
-                for (const [geo, mat] of [[V.strand, this.vineMat], [V.leaves, this.vineLeafMat]]) out.push(this._instanced(geo, mat, list));
-            }
+            const V = this.geos.vines[vi], L = this.geos.vinesLo[vi];
+            const lo = [this._instanced(L.strand, this.vineMat, list), this._instanced(L.leaves, this.vineLeafMat, list)];
+            group.vinesLo.push(...lo);
+            this.vineSwap.add(list.map((m) => ({ m })), lo, [[V.strand, this.vineMat], [V.leaves, this.vineLeafMat]]);
         });
         this.groups.push(group);
     }
@@ -488,28 +584,28 @@ class Vegetation {
     }
 
     // Hide forests on far islands (they're sub-pixel there anyway); trees near the camera
-    // use the detailed Blender models; vines get a detailed version up close, a light one
-    // at middle distance, and none beyond that.
+    // use the detailed Blender models (the nearest patches first, up to hiTrees trees);
+    // vines get a detailed version up close, a light one at middle distance, and none
+    // beyond that.
     // Near-tree reach depends on where the patch is in view: well over twice as far straight
     // ahead (plus how far the dragon flies in a second and a half), the plain range off to
     // the side, and less behind the camera, where nothing is seen. So the swap to the detailed
     // trees happens far out in front instead of just as the dragon arrives, for about the
     // same number of detailed trees in all.
     update(cam, range, camera = null) {
-        const VINE_HI = 900, VINE_LO = Math.min(range, 4500);
+        const VINE_HI = this.vineHi, VINE_LO = Math.min(range, 4500);
         const HI = this.hiRange;
         const fwd = _fwd.set(0, 0, 0);
         if (camera) camera.getWorldDirection(fwd);
         const ahead = Math.min(shared.uDragonVel.value.length(), 400) * 1.5;
-        const builds = [];
+        const wanted = [];
         this.ground?.update(cam, this.groundRange);
         this.rocks?.update(cam, range);
         for (const g of this.groups) {
             const d = Math.hypot(g.e.pos[0] - cam.x, g.e.pos[1] - cam.y, g.e.pos[2] - cam.z) - (g.e.r || 500);
             const vis = d < range;
             for (const m of g.meshes) m.visible = vis;
-            for (const m of g.vinesHi) m.visible = d < VINE_HI;
-            for (const m of g.vinesLo) m.visible = d >= VINE_HI && d < VINE_LO;
+            for (const m of g.vinesLo) m.visible = d < VINE_LO;
             for (const c of g.chunks) {
                 const dist = c.center.distanceTo(cam), dc = dist - c.r;
                 let lim = HI;
@@ -522,15 +618,23 @@ class Vegetation {
                     lim = ca >= 0.35 ? HI * (1 + 1.3 * front) + ahead * front : HI * Math.max(0.6, 1 + (ca - 0.35) * 0.5);
                 }
                 // a little hysteresis so a patch on the boundary doesn't flip every frame
-                const want = vis && dc < lim * (c.hi ? 1.2 : 1);
-                if (want === c.hi) continue;
-                // patches never built yet are built a couple per frame, nearest first
-                if (want && !c.meshes) builds.push([dc, g, c]);
-                else this._setHi(g, c, want);
+                // (patches already detailed also sort a little nearer than they are)
+                if (vis && dc < lim * (c.hi ? 1.2 : 1)) wanted.push([c.hi ? dc * 0.85 - 20 : dc, g, c]);
+                else if (c.hi) this._setHi(g, c, false);
             }
         }
-        builds.sort((a, b) => a[0] - b[0]);
-        for (const [, g, c] of builds.slice(0, 2)) this._setHi(g, c, true);
+        // nearest patches first, until the limit on detailed trees is reached; patches
+        // never built yet are built a couple per frame
+        wanted.sort((a, b) => a[0] - b[0]);
+        let trees = 0, built = 0;
+        for (const [, g, c] of wanted) {
+            const ok = trees === 0 || trees + c.trees.length <= this.hiTrees;
+            if (ok) trees += c.trees.length;
+            if (ok === c.hi) continue;
+            if (ok && !c.meshes && built++ >= 2) continue;
+            this._setHi(g, c, ok);
+        }
+        this.vineSwap.update(cam, VINE_HI);
     }
 }
 const ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
@@ -718,7 +822,8 @@ class Rocks {
         const key = this.shadeMat.customProgramCacheKey;
         this.shadeMat.customProgramCacheKey = () => key() + "shaded";
         this.groups = [];
-        this.hiRange = 700;
+        this.hiRange = 500;       // detailed rocks within this distance of the camera
+        this.swap = new NearSwap(scene, 250);
     }
 
     add(e, r) {
@@ -762,17 +867,17 @@ class Rocks {
                 lists.shard.push([m4.compose(p, q, s).clone(), tint(v, false)]);
             }
         }
-        const g = { e, hi: [], lo: [], state: -1 };
+        const g = { e, lo: [] };
         for (const [name, list] of Object.entries(lists)) {
             if (!list.length || !this.kit[name]) continue;
-            for (const lvl of ["hi", "lo"]) {
-                const im = new THREE.InstancedMesh(this.kit[name][lvl], name === "shard" ? this.shadeMat : this.mat, list.length);
-                list.forEach(([m, col], j) => { im.setMatrixAt(j, m); im.setColorAt(j, col); });
-                im.computeBoundingSphere();
-                im.visible = false;
-                this.scene.add(im);
-                g[lvl].push(im);
-            }
+            const mat = name === "shard" ? this.shadeMat : this.mat;
+            const im = new THREE.InstancedMesh(this.kit[name].lo, mat, list.length);
+            list.forEach(([m, col], j) => { im.setMatrixAt(j, m); im.setColorAt(j, col); });
+            im.computeBoundingSphere();
+            im.visible = false;
+            this.scene.add(im);
+            g.lo.push(im);
+            this.swap.add(list.map(([m, c]) => ({ m, c })), [im], [[this.kit[name].hi, mat]]);
         }
         this.groups.push(g);
     }
@@ -780,12 +885,10 @@ class Rocks {
     update(cam, range) {
         for (const g of this.groups) {
             const d = Math.hypot(g.e.pos[0] - cam.x, g.e.pos[1] - cam.y, g.e.pos[2] - cam.z) - (g.e.r || 500);
-            const st = d < this.hiRange ? 0 : d < Math.min(range, 7000) ? 1 : 2;
-            if (st === g.state) continue;
-            g.state = st;
-            for (const m of g.hi) m.visible = st === 0;
-            for (const m of g.lo) m.visible = st === 1;
+            const vis = d < Math.min(range, 7000);
+            for (const m of g.lo) m.visible = vis;
         }
+        this.swap.update(cam, this.hiRange);
     }
 }
 

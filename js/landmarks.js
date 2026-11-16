@@ -94,6 +94,22 @@ const BRANCH_CARD = (() => {
     g.setIndex(idx);
     return g;
 })();
+// The same card for the Worldtree seen from further off: fewer triangles (the crown has
+// some 85,000 cards). rows: how many bands along the twig (2 keeps the bend, 1 is flat).
+const simpleCard = (rows) => {
+    const pos = [], uv = [], idx = [];
+    for (let r = 0; r <= rows; r++) {
+        const t = r / rows;
+        for (const s of [-1, 1]) { pos.push(0.47 * s, t, -0.22 * t * t); uv.push(0.5 + 0.46 * s, t * 0.96); }
+        if (r) { const a = (r - 1) * 2; idx.push(a, a + 1, a + 3, a, a + 3, a + 2); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    g.setIndex(idx);
+    return g;
+};
+const CARD_MID = simpleCard(2), CARD_FAR = simpleCard(1);
 
 // a smooth path through control points (centripetal Catmull-Rom), n samples
 function smoothPath(ctrl, n) {
@@ -273,6 +289,8 @@ export class Landmarks {
         const S = 6;                  // stems in the braid
         const TWIST = Math.PI * 2 * 0.85;
         const bark = [], leaves = [], pads = [], fruit = [];
+        // lighter copies for when the tree is seen from further off (see lod below)
+        const barkLo = [], leavesMid = [], leavesFar = [];
         const toWorld = (p) => [base.x + p.x, base.y + p.y, base.z + p.z];
         const capsule = (a, b, r) => this.colliders.push({ t: "c", a: toWorld(a), b: toWorld(b), r });
 
@@ -290,7 +308,16 @@ export class Landmarks {
         };
         // collar: { a: parent axis point, d: parent direction, r: parent radius } bends this
         // tube's normals into the parent's where it grows out of it, so the join is seamless
-        const addTube = (pts, radius, sides, color, collar = null) => bark.push({ geo: tubeGeo(pts, radius, sides, 60), color, shade: barkShade, glow: veinGlow, collar, keepNormals: true });
+        const addTube = (pts, radius, sides, color, collar = null) => {
+            const part = (geo) => ({ geo, color, shade: barkShade, glow: veinGlow, collar, keepNormals: true });
+            bark.push(part(tubeGeo(pts, radius, sides, 60)));
+            // the distant copy: every third ring and about half the sides
+            const keep = [];
+            for (let i = 0; i < pts.length - 1; i += 3) keep.push(i);
+            keep.push(pts.length - 1);
+            const rLo = typeof radius === "function" ? (i, j, a) => radius(keep[i], j, a) : keep.map((i) => radius[i]);
+            barkLo.push(part(tubeGeo(keep.map((i) => pts[i]), rLo, Math.max(5, Math.round(sides * 0.55)), 60)));
+        };
         // the heading a branch sets off on: mostly along its parent's grain, turning toward
         // where it is going, so it slips out of the parent in a long smooth curve
         const setOff = (d, dir, k = 0.75) => d.clone().multiplyScalar(k).add(dir).add(new THREE.Vector3(0, 0.15, 0)).normalize();
@@ -480,11 +507,14 @@ export class Landmarks {
                         const nf = right.clone().cross(reach).normalize();
                         const sz = 20 + rand() * 14;
                         const at = q.clone().addScaledVector(rq(), 3);
-                        leaves.push({
-                            geo: BRANCH_CARD, uvRect: ALIEN_FAN, normalFrom: [c.x, c.y - thick * 1.6, c.z],
-                            matrix: new THREE.Matrix4().makeBasis(right, reach, nf).scale(V3(sz, sz, sz)).setPosition(at), color: hex, glow,
-                            stem: [at.x, at.y, at.z], phase: rand(),
+                        const card = (geo, k) => ({
+                            geo, uvRect: ALIEN_FAN, normalFrom: [c.x, c.y - thick * 1.6, c.z],
+                            matrix: new THREE.Matrix4().makeBasis(right, reach, nf).scale(V3(sz * k, sz * k, sz * k)).setPosition(at), color: hex, glow,
                         });
+                        leaves.push({ ...card(BRANCH_CARD, 1), stem: [at.x, at.y, at.z], phase: rand() });
+                        // further off: fewer, larger, simpler cards covering the same area
+                        if (n < 5) leavesMid.push(card(CARD_MID, 1.4));
+                        if (n < 2) leavesFar.push(card(CARD_FAR, 2.2));
                     }
                 }
             }
@@ -502,12 +532,13 @@ export class Landmarks {
                 const len = (pd.tier === 0 ? 160 : 90) + rand() * (pd.tier === 0 ? 300 : 160);
                 const q = new THREE.Quaternion().setFromAxisAngle(V3(0, 1, 0), -a + Math.PI / 2 + (rand() - 0.5) * 0.6);
                 const tint = tmpC.set(rand() < 0.3 ? "#f3d6ff" : rand() < 0.5 ? "#d4f6ff" : "#e8fff6");
-                leaves.push({
+                const curtain = {
                     geo: new THREE.PlaneGeometry(len * 0.3, len, 1, 4).translate(0, -len / 2, 0), uvRect: ALIEN_FILAMENT,
                     normalFrom: [c.x, c.y + thick, c.z], matrix: new THREE.Matrix4().compose(p, q, V3(1, 1, 1)),
                     color: "#" + tint.getHexString(), glow: (x, y) => 0.15 + THREE.MathUtils.clamp((p.y - y) / len, 0, 1) * 0.85,
-                    stem: [p.x, p.y, p.z], phase: rand(),
-                });
+                };
+                leaves.push({ ...curtain, stem: [p.x, p.y, p.z], phase: rand() });
+                leavesMid.push(curtain); leavesFar.push(curtain);
             }
             // lantern-fruit and glowing tendrils under the tier
             // (each entry is the point on the wood its thread hangs from)
@@ -541,14 +572,18 @@ export class Landmarks {
             addTube(stalk, collared(stalk, Math.min(7, sr * 0.6), 1.6, sr), 10, "#d6cebf", { a: s0, d: sd, r: sr });
             hearts.push([tip.x, tip.y - 1.2, tip.z, 9 + rand() * 9]);
         }
-        const tree = new THREE.Mesh(buildParts(bark), glowMaterial({ roughness: 0.85 }, "#7fe8ff", false, "bark"));
-        tree.position.copy(base);
-        this.scene.add(tree);
+        const mesh = (parts, mat) => { const m = new THREE.Mesh(buildParts(parts), mat); m.position.copy(base); this.scene.add(m); return m; };
+        const barkMat = glowMaterial({ roughness: 0.85 }, "#7fe8ff", false, "bark");
         const crownMat = foliageMaterial("#8ff3ff", textures().alien, 1.45, 0.12, true);
         crownMat.userData.cards = true;   // every leaf card swings on its own stem (gfx.js addWind)
-        const crown = new THREE.Mesh(buildParts(leaves), crownMat);
-        crown.position.copy(base);
-        this.scene.add(crown);
+        const crownLoMat = foliageMaterial("#8ff3ff", textures().alien, 1.45, 0.12, true);
+        // The full tree is over a million triangles, so it is only drawn from close by.
+        // level 0: everything; 1: half the leaf cards (larger) and light wood; 2: a fifth.
+        this.treeLod = {
+            c: base.clone().add(V3(0, H + 250, 0)), level: -1,
+            wood: [mesh(bark, barkMat), mesh(barkLo, barkMat)],
+            crown: [mesh(leaves, crownMat), mesh(leavesMid, crownLoMat), mesh(leavesFar, crownLoMat)],
+        };
         // glowing tendrils (the reason to come back at night)
         const tg = buildParts([{ geo: new THREE.CylinderGeometry(0.6, 0.15, 1, 8, 5).translate(0, -0.5, 0), color: "#cdd2ff", glow: (x, y) => 0.25 - y * 0.75 }]);
         const im = new THREE.InstancedMesh(tg, glowMaterial({ roughness: 0.8 }, "#c39bff"), this.tendrilSpots.length);
@@ -572,6 +607,21 @@ export class Landmarks {
             this.scene.add(fm);
         }
         this.treeTop = base.clone().add(V3(0, H + 380, 0));
+    }
+
+    // Pick the version of the Worldtree to draw from how far the camera is from the edge
+    // of its crown: everything within full metres of it, the middle version within mid.
+    // (Both come from the quality level.)
+    lod(cam, full = 700, mid = 3500) {
+        const T = this.treeLod;
+        const d = cam.distanceTo(T.c) - 1400;
+        // a little slack before stepping down, so it doesn't flip back and forth on a boundary
+        const level = d < full + (T.level === 0 ? 80 : 0) ? 0 : d < mid + (T.level === 1 ? 150 : 0) ? 1 : 2;
+        if (level === T.level) return;
+        T.level = level;
+        T.crown.forEach((m, i) => (m.visible = i === level));
+        T.wood[0].visible = level === 0;
+        T.wood[1].visible = level > 0;
     }
 
     // ---- Titan's Rest: the bones of a giant whale ---------------------------------------

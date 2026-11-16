@@ -122,7 +122,7 @@ export class Land {
         });
         this.mesh = new THREE.Mesh(geo, mat);
         this.mesh.frustumCulled = false;
-        this.mesh.renderOrder = -6;
+        this.mesh.renderOrder = 8;      // after the islands, so the land they hide is never shaded
         scene.add(this.mesh);
         this.sky = sky;
     }

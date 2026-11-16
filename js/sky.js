@@ -213,7 +213,9 @@ export class Sky {
         });
         this.dome = new THREE.Mesh(new THREE.SphereGeometry(1000, 48, 24), mat);
         this.dome.frustumCulled = false;
-        this.dome.renderOrder = -10;
+        // drawn after the islands, not before: its depth is the far plane, so only the pixels
+        // of sky actually left showing are worked out (it used to fill the whole screen first)
+        this.dome.renderOrder = 10;
         this.scene.add(this.dome);
     }
 

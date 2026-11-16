@@ -1,12 +1,14 @@
 // The post-processing chain, built to touch every screen pixel as few times as
 // possible (each full-screen pass costs about 10 ms at 1080p on integrated graphics):
 //
-//   scene (HDR, with depth)
+//   scene (HDR, with depth), drawn smaller than the screen on slower computers
+//   -> temporal anti-aliasing: each frame blended with the ones before it
 //   -> clouds (raymarched at reduced size)        volclouds.js
 //   -> sun shafts (half size)                      cinematic.js
 //   -> bloom (a small mip chain, half size and below)
-//   -> ONE full-size final pass: clouds + haze + shafts + bloom, tone mapping,
-//      sRGB, colour grade, vignette, grain and fringe, straight to the screen.
+//   -> ONE final pass at the screen's own size: sharpened upscale of the scene, clouds +
+//      haze + shafts + bloom, tone mapping, sRGB, colour grade, vignette, grain and
+//      fringe, straight to the screen.
 
 import * as THREE from "three";
 import { Pass, FullScreenQuad } from "three/addons/postprocessing/Pass.js";
@@ -16,6 +18,143 @@ import { shared } from "./gfx.js";
 const VS = /* glsl */ `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 
 const quad = (frag, uniforms) => new FullScreenQuad(new THREE.ShaderMaterial({ vertexShader: VS, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false }));
+
+// ---- temporal anti-aliasing ---------------------------------------------------------------
+// The trick most big games lean on for foliage. Every frame the camera is nudged by a
+// different fraction of a pixel, and the new frame is blended into a running average of
+// the frames before it. Over a few frames each pixel has been sampled at many spots, so
+// the hard cut-out edges of leaves, thin branches and distant forest come out smooth,
+// as if drawn at several times the resolution, for the price of one extra pass.
+// To follow the camera, each pixel looks up where its piece of the world was on screen
+// last frame (from the depth image); the old colour is kept only if it is close to what
+// is around the pixel now, so things that moved don't leave ghosts. The dragon moves
+// with the camera, so pixels near it are looked up with the dragon's own motion.
+const HALTON = [[0, -0.167], [-0.25, 0.167], [0.25, -0.389], [-0.375, -0.056], [0.125, 0.278], [-0.125, -0.278], [0.375, 0.056], [-0.438, 0.389]];
+export class TAAPass extends Pass {
+    constructor(camera) {
+        super();
+        this.camera = camera;
+        this.needsSwap = false;
+        const opt = { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
+        this.hist = [new THREE.WebGLRenderTarget(1, 1, opt), new THREE.WebGLRenderTarget(1, 1, opt)];
+        this.u = {
+            tCur: { value: null }, tHist: { value: null }, tDepth: { value: null }, uTexel: { value: new THREE.Vector2() }, uReset: { value: 1 },
+            uInvVP: { value: new THREE.Matrix4() }, uPrevVP: { value: new THREE.Matrix4() }, uCurVP: { value: new THREE.Matrix4() },
+            uDragon: { value: new THREE.Vector3(0, -1e6, 0) }, uDragonMove: { value: new THREE.Vector3() },
+        };
+        this.q = quad(/* glsl */ `
+            uniform sampler2D tCur, tHist, tDepth; uniform vec2 uTexel; uniform float uReset;
+            uniform mat4 uInvVP, uPrevVP, uCurVP; uniform vec3 uDragon, uDragonMove;
+            varying vec2 vUv;
+            // work on compressed brightness, so one very bright pixel (the sun, a glint) can't flicker
+            // A pixel that overflowed (looking into the sun) or isn't a number would otherwise
+            // get into the running average and spread through it until the screen went dark.
+            vec3 ok(vec3 c){ return (any(isnan(c)) || any(isinf(c))) ? vec3(0.0) : clamp(c, 0.0, 3.0e4); }
+            vec3 tm(vec3 c){ c = ok(c); return c / (1.0 + max(c.r, max(c.g, c.b))); }
+            vec3 itm(vec3 c){ return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-3); }
+            // Read the running average with a sharp (Catmull-Rom) filter, in five lookups.
+            // A plain smooth lookup blurs the picture a little more every frame the camera
+            // moves, which is what made everything look out of focus.
+            vec3 histSharp(vec2 uv){
+                vec2 pos = uv / uTexel, c1 = floor(pos - 0.5) + 0.5, f = pos - c1;
+                vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+                vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+                vec2 w12 = w1 + w2, t0 = (c1 - 1.0) * uTexel, t3 = (c1 + 2.0) * uTexel, t12 = (c1 + w2 / w12) * uTexel;
+                vec4 r = vec4(texture2D(tHist, vec2(t12.x, t0.y)).rgb, 1.0) * (w12.x * w0.y)
+                       + vec4(texture2D(tHist, vec2(t0.x, t12.y)).rgb, 1.0) * (w0.x * w12.y)
+                       + vec4(texture2D(tHist, vec2(t12.x, t12.y)).rgb, 1.0) * (w12.x * w12.y)
+                       + vec4(texture2D(tHist, vec2(t3.x, t12.y)).rgb, 1.0) * (w3.x * w12.y)
+                       + vec4(texture2D(tHist, vec2(t12.x, t3.y)).rgb, 1.0) * (w12.x * w3.y);
+                return ok(r.rgb / max(r.a, 1e-4));
+            }
+            void main(){
+                vec4 c4 = texture2D(tCur, vUv);
+                vec3 c = tm(c4.rgb);
+                float leaf = 1.0 - c4.a;       // foliage marks its pixels (gfx.js): it moves in the wind
+                vec3 mn = c, mx = c, m1 = c, m2 = c * c;
+                float d = texture2D(tDepth, vUv).x;
+                for (int i = 0; i < 4; i++) {
+                    vec2 o = (i == 0 ? vec2(1.0, 0.0) : i == 1 ? vec2(-1.0, 0.0) : i == 2 ? vec2(0.0, 1.0) : vec2(0.0, -1.0)) * uTexel;
+                    vec3 a = tm(texture2D(tCur, vUv + o).rgb);
+                    mn = min(mn, a); mx = max(mx, a); m1 += a; m2 += a * a;
+                    // the nearest thing around this pixel decides its motion, so the edge of a
+                    // near leaf against far sky moves with the leaf
+                    d = min(d, texture2D(tDepth, vUv + o).x);
+                    vec2 o2 = (i == 0 ? vec2(1.0, 1.0) : i == 1 ? vec2(-1.0, 1.0) : i == 2 ? vec2(1.0, -1.0) : vec2(-1.0, -1.0)) * uTexel;
+                    vec3 b = tm(texture2D(tCur, vUv + o2).rgb);
+                    mn = min(mn, b); mx = max(mx, b); m1 += b; m2 += b * b;
+                }
+                if (uReset > 0.5) { gl_FragColor = vec4(ok(itm(c)), 1.0); return; }
+                m1 /= 9.0;
+                vec3 sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+                mn = max(mn, m1 - 1.25 * sd); mx = min(mx, m1 + 1.25 * sd);
+                vec4 w = uInvVP * vec4(vUv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+                vec3 wp = w.xyz / w.w, was = wp;
+                if (d < 0.99999 && distance(wp, uDragon) < 26.0) was -= uDragonMove;
+                vec4 pc = uPrevVP * vec4(was, 1.0), cc = uCurVP * vec4(wp, 1.0);
+                vec2 vel = (pc.xy / pc.w - cc.xy / cc.w) * 0.5;
+                vec2 huv = vUv + vel;
+                if (pc.w <= 0.0 || any(lessThan(huv, vec2(0.0))) || any(greaterThan(huv, vec2(1.0)))) { gl_FragColor = vec4(itm(c), 1.0); return; }
+                vec3 h = tm(histSharp(huv));
+                h = clamp(h, mn, mx);
+                // more of the new frame where the picture is moving fast (crisp in motion,
+                // smoothest when still)
+                float k = mix(0.12, 0.4, clamp(length(vel / uTexel) / 16.0, 0.0, 1.0));
+                k = max(k, leaf * 0.55);
+                gl_FragColor = vec4(ok(itm(mix(h, c, k))), 1.0);
+            }`, this.u);
+        this.w = this.h = 1;
+        this.frame = 0;
+        this.reset = true;
+        this.prevVP = new THREE.Matrix4();
+        this.lastCam = new THREE.Vector3();
+        this.lastDragon = null;
+    }
+
+    setSize(w, h) {
+        this.w = w; this.h = h;
+        for (const t of this.hist) t.setSize(w, h);
+        this.u.uTexel.value.set(1 / w, 1 / h);
+        this.reset = true;
+    }
+
+    // Call just before the scene is drawn: shifts the view by a fraction of a pixel.
+    jitter() {
+        const [x, y] = HALTON[this.frame++ % HALTON.length];
+        this.camera.setViewOffset(this.w, this.h, x, y, this.w, this.h);
+    }
+
+    // where the dragon is now (null: no dragon in view), so its pixels are followed properly
+    setDragon(pos) {
+        const u = this.u;
+        if (pos && this.lastDragon) { u.uDragon.value.copy(pos); u.uDragonMove.value.subVectors(pos, this.lastDragon); }
+        else u.uDragon.value.set(0, -1e6, 0);
+        this.lastDragon = pos ? (this.lastDragon || new THREE.Vector3()).copy(pos) : null;
+    }
+
+    render(renderer, writeBuffer, readBuffer) {
+        const u = this.u, cam = this.camera, [read, write] = this.hist;
+        // this frame's view without the sub-pixel shift, to measure real motion against
+        const view = cam.view, on = view && view.enabled;
+        if (on) { view.enabled = false; cam.updateProjectionMatrix(); }
+        u.uCurVP.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+        if (on) { view.enabled = true; cam.updateProjectionMatrix(); }
+        u.uInvVP.value.multiplyMatrices(cam.matrixWorld, cam.projectionMatrixInverse);
+        u.uPrevVP.value.copy(this.prevVP);
+        // a jump (respawn, a new view): start the average afresh
+        if (cam.position.distanceTo(this.lastCam) > 400) this.reset = true;
+        u.uReset.value = this.reset ? 1 : 0;
+        u.tCur.value = readBuffer.texture; u.tDepth.value = readBuffer.depthTexture; u.tHist.value = read.texture;
+        renderer.setRenderTarget(write);
+        this.q.render(renderer);
+        this.hist.reverse();
+        this.prevVP.copy(u.uCurVP.value);
+        this.lastCam.copy(cam.position);
+        this.reset = false;
+    }
+
+    get texture() { return this.hist[0].texture; }
+}
 
 // ---- bloom ----------------------------------------------------------------------------------
 // Bright parts are cut out at half size, blurred down a chain of ever-smaller images and
@@ -56,6 +195,7 @@ export class BloomPass extends Pass {
                 gl_FragColor = vec4(c / 12.0 + texture2D(tHere, vUv).rgb * uWeight, 1.0);
             }`, this.upU);
         this.size = new THREE.Vector2(1, 1);
+        this.taa = null;       // when set, bloom reads the smoothed image
     }
 
     setSize(w, h) {
@@ -70,7 +210,7 @@ export class BloomPass extends Pass {
     get texture() { return this.up[0].texture; }
 
     render(renderer, writeBuffer, readBuffer) {
-        this.preU.tSrc.value = readBuffer.texture;
+        this.preU.tSrc.value = this.taa?.enabled ? this.taa.texture : readBuffer.texture;
         this.preU.uTexel.value.set(1 / this.size.x, 1 / this.size.y);
         renderer.setRenderTarget(this.down[0]);
         this.pre.render(renderer);
@@ -95,14 +235,18 @@ export class BloomPass extends Pass {
 }
 
 // ---- the one full-size pass -------------------------------------------------------------------
+// It runs at the screen's own size even when the scene was drawn smaller: the scene is
+// stretched up here with a sharpening filter (as console games do), which looks far
+// crisper than letting the browser stretch a small canvas.
 export class FinalPass extends Pass {
-    constructor({ camera, clouds, rays, bloom, grade }) {
+    constructor({ camera, clouds, rays, bloom, grade, taa }) {
         super();
         this.camera = camera;
-        this.clouds = clouds; this.rays = rays; this.bloom = bloom;
+        this.clouds = clouds; this.rays = rays; this.bloom = bloom; this.taa = taa;
         this.u = {
             tScene: { value: null }, tDepth: { value: null }, tCloud: { value: null }, tRays: { value: null }, tBloom: { value: null },
             uClouds: { value: 0 }, uRays: { value: 0 }, uBloom: { value: 0.32 }, uExposure: { value: 1 },
+            uSTexel: { value: new THREE.Vector2(1, 1) }, uSharp: { value: 0.55 },
             uInvProj: { value: new THREE.Matrix4() }, uCamWorld: { value: new THREE.Matrix4() }, uCam: { value: new THREE.Vector3() },
             uNear: { value: 1 }, uFar: { value: 1000 }, uCTexel: { value: new THREE.Vector2(1, 1) },
             uSunDir: shared.uSunDir, uSunColor: shared.uSunColor, uHaze: shared.uHaze,
@@ -112,7 +256,7 @@ export class FinalPass extends Pass {
             #include <packing>
             uniform sampler2D tScene, tDepth, tCloud, tRays, tBloom;
             uniform float uClouds, uRays, uBloom, uExposure, uNear, uFar;
-            uniform mat4 uInvProj, uCamWorld; uniform vec3 uCam, uSunDir, uSunColor, uHaze; uniform vec2 uCTexel;
+            uniform mat4 uInvProj, uCamWorld; uniform vec3 uCam, uSunDir, uSunColor, uHaze; uniform vec2 uCTexel, uSTexel; uniform float uSharp;
             float lz(vec2 uv){ float d = texture2D(tDepth, uv).x; return d >= 0.99999 ? 1e7 : -perspectiveDepthToViewZ(d, uNear, uFar); }
             // The clouds are marched at reduced size. Stretched up plainly, each cloud pixel
             // straddling the dragon's outline blends clear air into the cloud beside it (and
@@ -146,14 +290,28 @@ export class FinalPass extends Pass {
             void main(){
                 vec2 cc = vUv - 0.5;
                 float r2 = dot(cc, cc);
-                vec3 col;
+                // sharpen: push each pixel away from the average of its four neighbours, but
+                // never beyond the brightest or darkest of them (no halos), on compressed
+                // brightness so highlights don't ring
+                vec3 col = texture2D(tScene, vUv).rgb;
+                {
+                    vec3 c0 = col / (1.0 + col);
+                    vec3 a = texture2D(tScene, vUv + vec2(uSTexel.x, 0.0)).rgb, b = texture2D(tScene, vUv - vec2(uSTexel.x, 0.0)).rgb;
+                    vec3 c = texture2D(tScene, vUv + vec2(0.0, uSTexel.y)).rgb, d = texture2D(tScene, vUv - vec2(0.0, uSTexel.y)).rgb;
+                    a /= 1.0 + a; b /= 1.0 + b; c /= 1.0 + c; d /= 1.0 + d;
+                    vec3 lo = min(c0, min(min(a, b), min(c, d))), hi = max(c0, max(max(a, b), max(c, d)));
+                    vec3 s = clamp(c0 + (c0 - (a + b + c + d) * 0.25) * uSharp, lo, hi);
+                    col = s / max(1.0 - s, 1e-3);
+                }
                 if (uFringe > 0.0005) {
                     vec2 o = cc * r2 * uFringe;
-                    col = vec3(texture2D(tScene, vUv - o).r, texture2D(tScene, vUv).g, texture2D(tScene, vUv + o).b);
-                } else col = texture2D(tScene, vUv).rgb;
+                    col.r = texture2D(tScene, vUv - o).r; col.b = texture2D(tScene, vUv + o).b;
+                }
                 if (uClouds > 0.5) {
                     vec4 cl = cloudAt(vUv);
                     col = col * cl.a + cl.rgb;
+                }
+                {
                     // low-lying haze: thickest at the deck, thinning with height, warm toward the sun
                     vec4 vp = uInvProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
                     vec3 vdir = normalize(vp.xyz / vp.w);
@@ -187,9 +345,11 @@ export class FinalPass extends Pass {
             }`, this.u);
     }
 
+    setSize(w, h) { this.u.uSTexel.value.set(1 / w, 1 / h); }
+
     render(renderer, writeBuffer, readBuffer) {
         const u = this.u, cam = this.camera;
-        u.tScene.value = readBuffer.texture;
+        u.tScene.value = this.taa?.enabled ? this.taa.texture : readBuffer.texture;
         u.tDepth.value = readBuffer.depthTexture;
         u.uClouds.value = this.clouds?.enabled ? 1 : 0;
         if (u.uClouds.value) {

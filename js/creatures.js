@@ -11,6 +11,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // carries the attributes the shaders below animate and shade with; without the file
 // the code-built shapes are used instead.
 const ORIGIN = new THREE.Vector3();
+const NONE = new THREE.Matrix4().makeScale(0, 0, 0);
 
 export async function loadCreatureModels(url = "models/creatures.glb") {
     const gltf = await new GLTFLoader().loadAsync(url);
@@ -162,8 +163,9 @@ function whaleMaterial(phase, glowColor) {
 // A manta: a lens-thick body with swept wings, cephalic fins either side of the
 // mouth and a whip tail. Unit span, +z forward; the top and bottom skins meet at
 // the rim. mp holds the planform position and which skin it is (1 top, -1 belly, 0 tail).
-function mantaGeometry() {
-    const NU = 56, NV = 24;
+// lo: the light version drawn for rays far from the dragon (about a tenth of the triangles)
+function mantaGeometry(lo = false) {
+    const NU = lo ? 22 : 56, NV = lo ? 8 : 24;
     const g2 = (x, w) => Math.exp(-(x * x) / (w * w));
     const front = (a) => 0.36 * Math.pow(1 - a, 1.25) - 0.06 * a + 0.1 * g2(a - 0.075, 0.03) - 0.035 * g2(a, 0.035);
     const back = (a) => -0.4 + 0.3 * Math.pow(a, 0.6);
@@ -189,7 +191,7 @@ function mantaGeometry() {
         }
     }
     // whip tail
-    const tail = new THREE.ConeGeometry(0.011, 0.62, 8, 6).rotateX(-Math.PI / 2).translate(0, 0.004, -0.69);
+    const tail = new THREE.ConeGeometry(0.011, 0.62, lo ? 4 : 8, lo ? 2 : 6).rotateX(-Math.PI / 2).translate(0, 0.004, -0.69);
     const o = pos.length / 3, TP = tail.attributes.position;
     for (let i = 0; i < TP.count; i++) { pos.push(TP.getX(i), TP.getY(i), TP.getZ(i)); mp.push(TP.getX(i), TP.getZ(i), 0); }
     for (const k of tail.index.array) idx.push(o + k);
@@ -289,7 +291,8 @@ function mantaMaterial() {
 // A small bird, wingspan about 5 m, +z forward: a rounded body with head and beak,
 // long wings whose outer primaries split into fingers, and a forked tail.
 // fp: x = part (0 body, 1 wing, 2 tail), y and z = position across that part (0..1)
-function skylingGeometry() {
+// lo: the light version drawn for flocks far from the dragon (about 200 triangles a bird)
+function skylingGeometry(lo = false) {
     const pos = [], fp = [], idx = [];
     const grid = (nu, nv, at, part, flip) => {
         const o = pos.length / 3;
@@ -304,14 +307,14 @@ function skylingGeometry() {
     };
     // body: rings along z, from beak tip back to the tail root
     const prof = [[1.75, 0.0], [1.5, 0.05], [1.38, 0.14], [1.2, 0.19], [1.0, 0.16], [0.75, 0.26], [0.35, 0.31], [-0.1, 0.27], [-0.45, 0.18], [-0.7, 0.09]];
-    grid(28, 17, (u, w) => {
+    grid(lo ? 10 : 28, lo ? 7 : 17, (u, w) => {
         const f = u * (prof.length - 1), k = Math.min(prof.length - 2, Math.floor(f)), t = f - k, e = t * t * (3 - 2 * t);
         const z = prof[k][0] + (prof[k + 1][0] - prof[k][0]) * t, r = prof[k][1] + (prof[k + 1][1] - prof[k][1]) * e, a = w * Math.PI * 2;
         return [Math.sin(a) * r, Math.cos(a) * r * 0.85 + 0.06 * Math.min(1, Math.max(0, (z - 0.8) / 0.4)), z];
     }, 0, false);
     // wings: leading edge swept slightly back, outer primaries split into fingers
     for (const s of [1, -1]) {
-        grid(26, 6, (u, w) => {
+        grid(lo ? 12 : 26, lo ? 3 : 6, (u, w) => {
             const x = 0.18 + u * 2.45;
             // tapering to a rounded point, with the primaries splitting into fingers
             const taper = (1 - 0.45 * Math.pow(u, 1.5)) * Math.sqrt(Math.max(0, 1 - Math.pow(u, 4)));
@@ -323,7 +326,7 @@ function skylingGeometry() {
         }, 1, s < 0);
     }
     // forked tail
-    grid(9, 4, (u, w) => {
+    grid(lo ? 5 : 9, lo ? 2 : 4, (u, w) => {
         const a = (u - 0.5) * 1.1, len = 0.9 + 0.35 * Math.abs(u - 0.5) * 2;
         return [Math.sin(a) * w * len * 0.8 + (u - 0.5) * 0.12, 0.02, -0.55 - Math.cos(a) * w * len];
     }, 2, true);
@@ -491,6 +494,7 @@ export class Creatures {
     constructor(scene, entities, landmarks, models = {}) {
         this.scene = scene;
         this.models = models;
+        this.detail = 1;      // from the quality level: how far out the sculpted creatures are drawn
         this.whales = [];
         const geo = models.whale || whaleGeometry();
         const P = (a) => a.map((v) => new THREE.Vector3(...v));
@@ -518,7 +522,7 @@ export class Creatures {
 
     // ---- skylings: small flocking fliers ---------------------------------------------------
     _skylings() {
-        const g = this.models.skyling || skylingGeometry(), mat = skylingMaterial();
+        const g = this.models.skyling || skylingGeometry(), gLo = skylingGeometry(true), mat = skylingMaterial();
         this.flocks = [];
         const rand = mulberry32(17);
         const anchors = [[-300, 2450, 1500, 700], [-2600, 2900, -4600, 900], [5400, 3000, 2400, 600], [-4200, 2550, 1800, 650]];
@@ -528,12 +532,18 @@ export class Creatures {
             const palette = [0xffb35c, 0xff7d6b, 0xffe08a, 0x7fe3ef];
             for (let i = 0; i < N; i++) im.setColorAt(i, new THREE.Color(palette[Math.floor(rand() * palette.length)]));
             im.frustumCulled = false;
-            this.scene.add(im);
+            // the same birds as simple shapes, for when the flock is far off (they share
+            // the positions and colours, so only one of the two is ever drawn)
+            const lo = new THREE.InstancedMesh(gLo, mat, N);
+            lo.instanceMatrix = im.instanceMatrix;
+            lo.instanceColor = im.instanceColor;
+            lo.frustumCulled = false;
+            this.scene.add(im, lo);
             const birds = [];
             for (let i = 0; i < N; i++) {
                 birds.push({ p: new THREE.Vector3(ax + (rand() - 0.5) * 100, ay + (rand() - 0.5) * 60, az + (rand() - 0.5) * 100), v: new THREE.Vector3(rand() - 0.5, 0, rand() - 0.5).multiplyScalar(30) });
             }
-            this.flocks.push({ im, birds, center: [ax, ay, az], radius: ar, a: rand() * 6.28, sp: 0.04 + rand() * 0.03 });
+            this.flocks.push({ im, lo, birds, center: [ax, ay, az], radius: ar, a: rand() * 6.28, sp: 0.04 + rand() * 0.03 });
         }
     }
 
@@ -544,11 +554,15 @@ export class Creatures {
             f.a += f.sp * dt;
             const anchor = new THREE.Vector3(f.center[0] + Math.cos(f.a) * f.radius, f.center[1] + Math.sin(f.a * 2.3) * 120, f.center[2] + Math.sin(f.a) * f.radius);
             const near = playerPos.distanceTo(anchor) < 3000;
-            f.im.visible = near;
+            f.im.visible = f.lo.visible = false;
             if (!near) continue;
             avgP.set(0, 0, 0); avgV.set(0, 0, 0);
             for (const b of f.birds) { avgP.add(b.p); avgV.add(b.v); }
             avgP.divideScalar(f.birds.length); avgV.divideScalar(f.birds.length);
+            // sculpted birds only when the flock is close (with slack so it doesn't flicker)
+            f.close = playerPos.distanceTo(avgP) < 450 * this.detail * (f.close ? 1.15 : 1);
+            f.im.visible = f.close;
+            f.lo.visible = !f.close;
             f.birds.forEach((b, i) => {
                 steer.set(0, 0, 0);
                 steer.addScaledVector(tmp.copy(avgP).sub(b.p), 0.15);
@@ -586,7 +600,7 @@ export class Creatures {
         const bellGeo = this.models.jelly || new THREE.SphereGeometry(1, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.55);
         // the Blender bell overlaps its oral arms, so it adds a little less light
         const layered = this.models.jelly ? "0.75" : "1.0";
-        const shader = (isTendril) => new THREE.ShaderMaterial({
+        const shader = (isTendril, layered = "1.0") => new THREE.ShaderMaterial({
             uniforms: { uTime: shared.uTime, uSun: shared.uGlow },
             transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
             vertexShader: `uniform float uTime; varying vec3 vN, vV, vC; varying float vY;
@@ -609,7 +623,9 @@ export class Creatures {
                     ${SHADER_END}
                 }`,
         });
-        this.bells = new THREE.InstancedMesh(bellGeo, shader(false), N);
+        this.bells = new THREE.InstancedMesh(bellGeo, shader(false, layered), N);
+        // a plain bell for when the whole swarm is far away
+        this.bellsLo = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 6, 0, Math.PI * 2, 0, Math.PI * 0.55), shader(false), N);
         const tGeo = new THREE.CylinderGeometry(0.02, 0.005, 1, 3, 10).translate(0, -0.5, 0);
         this.tendrils = new THREE.InstancedMesh(tGeo, shader(true), N * T);
         const palette = [new THREE.Color(0.3, 0.9, 1.0), new THREE.Color(1.0, 0.45, 0.85), new THREE.Color(0.65, 0.5, 1.0), new THREE.Color(0.4, 1.0, 0.7)];
@@ -622,14 +638,21 @@ export class Creatures {
             const a = rand() * 6.28, d = 150 + rand() * 850;
             this.jellies.push({ home: new THREE.Vector3(C.x + Math.cos(a) * d, C.y - 700 + rand() * 1200, C.z + Math.sin(a) * d), p: new THREE.Vector3(), r, ph: rand() * 6.28, sp: 0.4 + rand() * 0.4, push: new THREE.Vector3() });
         }
-        this.bells.frustumCulled = this.tendrils.frustumCulled = false;
-        this.scene.add(this.bells, this.tendrils);
+        this.bellsLo.instanceMatrix = this.bells.instanceMatrix;
+        this.bellsLo.instanceColor = this.bells.instanceColor;
+        this.bells.frustumCulled = this.bellsLo.frustumCulled = this.tendrils.frustumCulled = false;
+        this.scene.add(this.bells, this.bellsLo, this.tendrils);
         this.drifterC = C;
     }
 
     _updateDrifters(dt, t, playerPos) {
-        const near = playerPos.distanceTo(this.drifterC) < 6000;
-        this.bells.visible = this.tendrils.visible = near;
+        const dist = playerPos.distanceTo(this.drifterC);
+        const near = dist < 6000;
+        // the swarm spreads about 1 km from its centre: sculpted bells once the dragon is near its edge
+        this.jelliesClose = dist < (1000 + 1300 * this.detail) * (this.jelliesClose ? 1.1 : 1);
+        this.tendrils.visible = near;
+        this.bells.visible = near && this.jelliesClose;
+        this.bellsLo.visible = near && !this.jelliesClose;
         if (!near) return;
         const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
         const T = 7;
@@ -658,9 +681,13 @@ export class Creatures {
     // ---- great sky rays ---------------------------------------------------------------------
     _rays() {
         const N = 12;
-        this.rays = new THREE.InstancedMesh(this.models.manta || mantaGeometry(), mantaMaterial(), N);
-        this.rays.frustumCulled = false;
-        this.scene.add(this.rays);
+        const rayMat = mantaMaterial();
+        this.rays = new THREE.InstancedMesh(this.models.manta || mantaGeometry(), rayMat, N);
+        // each ray is drawn sculpted when near and as a simple shape when far (the other
+        // copy is shrunk to nothing)
+        this.raysLo = new THREE.InstancedMesh(mantaGeometry(true), rayMat, N);
+        this.rays.frustumCulled = this.raysLo.frustumCulled = false;
+        this.scene.add(this.rays, this.raysLo);
         const rand = mulberry32(81);
         const centers = [[-2600, 3200, -4600], [-7000, 2300, -1600], [5400, 3300, 2400], [0, 2900, 0]];
         this.rayList = [];
@@ -670,7 +697,7 @@ export class Creatures {
         }
     }
 
-    _updateRays(dt, t) {
+    _updateRays(dt, t, playerPos) {
         const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3(), p2 = new THREE.Vector3();
         this.rayList.forEach((r, i) => {
             r.a += r.sp * dt;
@@ -682,10 +709,14 @@ export class Creatures {
             q.setFromRotationMatrix(m4);
             q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.sign(r.sp) * 0.3));
             s.setScalar(r.size);
-            this.rays.setMatrixAt(i, m4.compose(p, q, s));
+            m4.compose(p, q, s);
+            r.far = p.distanceTo(playerPos) > 1400 * this.detail * (r.far ? 1 : 1.15);
+            this.rays.setMatrixAt(i, r.far ? NONE : m4);
+            this.raysLo.setMatrixAt(i, r.far ? m4 : NONE);
             r.pos = p.clone();
         });
         this.rays.instanceMatrix.needsUpdate = true;
+        this.raysLo.instanceMatrix.needsUpdate = true;
     }
 
     // ---- seed wisps drifting off the Worldtree --------------------------------------------------
@@ -727,7 +758,7 @@ export class Creatures {
         for (const w of this.whales) w.update(dt, t);
         this._updateFlocks(dt, playerPos);
         this._updateDrifters(dt, t, playerPos);
-        this._updateRays(dt, t);
+        this._updateRays(dt, t, playerPos);
     }
 
     // Whales as obstacles: capsules along their length

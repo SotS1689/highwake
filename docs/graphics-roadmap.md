@@ -31,6 +31,25 @@ Direction: painterly-cinematic, 60 fps on desktops and good laptops, with lower 
 - **One full-screen pass**: clouds, haze, sun shafts, bloom, tone mapping and the grade are combined in `js/post.js`; the clouds, shafts and bloom are computed at reduced size.
 - **Detail levels**: hanging vines have a light distant version and vanish far away; every island has a coarse copy for distance, also used for the horizon giants. Triangles per frame at the busiest view fell from about 24 million to 1.7 million.
 - **Tuned during loading**: shaders are compiled and textures uploaded before play, then a short benchmark picks the best quality and resolution that leave room for 60 fps (`_calibrate` in `js/game.js`). In flight, dynamic resolution lowers or raises the render size to hold the frame rate, and only drops effects if that isn't enough.
+- **Regular PCs and laptops (integrated graphics)**: measured on a Ryzen 5700G's built-in Radeon. The cost was triangles first, then pixels:
+  - `buildParts` (`js/gfx.js`) keeps shared corners (indexed geometry), so the graphics card works each corner out once instead of 3 to 6 times.
+  - The Worldtree (over a million triangles, once drawn in full from any distance) has three versions, picked by distance in `Landmarks.lod`: full, a middle one (half the leaf cards, larger; light wood) and a far one (a fifth of the cards as flat quads).
+  - Skyling flocks, lantern-jellies and sky rays have simple far versions (`js/creatures.js`); a far flock fell from 450,000 triangles to about 13,000.
+  - Detailed vines and rocks are built per cell near the camera (`NearSwap` in `js/islands.js`) instead of for a whole island at once, and the number of detailed trees is capped per quality level (nearest first).
+  - The canvas has no anti-aliasing of its own (it cost about 40% of the frame on Low); Medium also goes without (about 25%). High and Ultra keep theirs.
+  - The loading benchmark also times a forest close-up, the dearest view per pixel, and Low may now run at full resolution.
+  - Result on that PC, 1025x768: Low went from 12-17 ms a frame (at 3/4 resolution) to 5-8 ms (at full resolution); the benchmark now picks Medium where it picked Low.
+- **Smooth leaves without the cost (the tricks big games use)**:
+  - Temporal anti-aliasing (`TAAPass` in `js/post.js`): the camera is nudged a fraction of a pixel each frame and frames are blended, so cut-out leaf edges and distant forest come out smooth. It replaces multisampling on every level but Ultra. Pixels near the dragon follow the dragon's own motion so it doesn't smear.
+  - Sharpened upscale: the canvas stays at screen size; only the scene is drawn smaller (dynamic resolution), and the final pass stretches it up with a sharpening filter instead of the browser's blurry stretch.
+  - Low now gets the same bloom, colour grade and haze as the rest (they cost little); distance haze is on at every level.
+  - Painted depth: foliage is lighter on top of a crown and darker beneath (`foliageMaterial`), the ground under trees is darkened once at load (`shadeUnderTrees` in `js/islands.js`), far leaves are read from a blurrier copy of the texture, and neighbouring trees share colours more, so distant forest reads as masses rather than speckle.
+  - Focus: the running average is read with a sharp (Catmull-Rom) filter and leans on the new frame when moving; textures are read from a sharper copy than usual (`uLodBias` in `js/gfx.js`), more so when the scene is drawn small; the benchmark gives up effects before resolution and dynamic resolution stops at 55%.
+  - Half the trees, each about a quarter larger (`js/mesher.js`), with detailed trees reaching about 45% further and ground cover on Low.
+  - Leaves stay crisp in the wind: foliage marks its pixels (alpha 0 in the scene image) and the frame blending keeps mostly the new frame there, since it only knows the camera's motion, not the wind's. Bad pixels (overflow, not-a-number) are kept out of the running average.
+  - A quarter of the original trees, each about a third larger; detailed trees reach 320 m (Low) to 1000 m (Ultra).
+  - Island rock and grass: triplanar projections that add under 5% are skipped (about a third of the texture lookups), anisotropy 4. The sky dome and the land far below are drawn after the islands, so hidden pixels of them are never shaded.
+  - Not yet measured on a quiet machine: the last timings were taken while something else was using the graphics card.
 - A browser drawing without the graphics card (software rendering) is detected and the player is told to turn on hardware acceleration.
 
 ## Next, in order
